@@ -71,6 +71,8 @@ use crate::dict_cache::TableDef;
 use crate::dict_client;
 use crate::record::Record;
 use crate::row_codec::push_padded;
+use crate::row_codec::stored_len;
+use crate::row_codec::PackedRow;
 
 /// A value longer than a write takes: its MySQL type's limit, or what a
 /// column without a parts table holds inline ([`BlobSizes::holds`]).
@@ -1273,82 +1275,33 @@ pub type EachColumn<'row, 'f> =
 /// value as a request carries it, a variable-sized one behind its
 /// length bytes, `None` for NULL. The words the row took. Bit columns,
 /// which no blob read asks for, are refused, as is a row not as asked
-/// for (`IC_ERROR_INCONSISTENT_DATA`).
+/// for (`IC_ERROR_INCONSISTENT_DATA`). The layout is read by the
+/// parser every row is unpacked with (`row_codec::PackedRow`).
 pub fn walk_packed<'a>(
   table: &TableDef,
   words: &'a [u32],
   each: &mut EachColumn<'a, '_>,
 ) -> Result<usize, IcError> {
   let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
-  let header = match words.first() {
-    Some(header) => *header,
-    None => return Err(bad),
-  };
-  if column_header::column_id(header) != crate::row_codec::IC_COL_READ_MASKED {
-    return Err(bad);
-  }
-  let mask_words = (column_header::byte_size(header) / 4) as usize;
-  if words.len() < 1 + mask_words {
-    return Err(bad);
-  }
-  let mask = &words[1..1 + mask_words];
-  let data = crate::node_connect::words_as_bytes(&words[1 + mask_words..]);
-  let total_bits = 32 * mask_words;
-  let mut pos: usize = 0;
-  let mut bit: usize = 0;
-  let mut attr_id: u32 = 0;
-  while bit < total_bits {
-    let rest = mask[bit / 32] >> (bit % 32);
-    if rest == 0 {
-      let skip = 32 - bit % 32;
-      bit += skip;
-      attr_id += skip as u32;
-      continue;
-    }
-    let zeros = rest.trailing_zeros() as usize;
-    bit += zeros + 1;
-    let id = attr_id + zeros as u32;
-    attr_id = id + 1;
+  let mut packed = PackedRow::open(words)?;
+  while let Some(id) = packed.next_column() {
     let attr = match table.field(id) {
       Some(attr) => attr,
       None => return Err(bad),
     };
-    // After a nullable column read, one more bit: set for NULL.
-    if attr.nullable {
-      let null = bit < total_bits && (mask[bit / 32] >> (bit % 32)) & 1 != 0;
-      bit += 1;
-      if null {
-        each(attr, None)?;
-        continue;
-      }
+    if attr.nullable && packed.null() {
+      each(attr, None)?;
+      continue;
     }
     if attr.size_bits_log2 == table_props::IC_COLUMN_SIZE_BIT {
       return Err(bad);
     }
-    // A wide type starts on a word, a byte array on the next byte.
-    if attr.size_bits_log2 >= table_props::IC_COLUMN_SIZE_32 {
-      pos = pos.next_multiple_of(4);
-    }
-    let len = match attr.array_kind {
-      table_props::IC_ARRAY_KIND_SHORT_VARSIZE => match data.get(pos) {
-        Some(n) => 1 + *n as usize,
-        None => return Err(bad),
-      },
-      table_props::IC_ARRAY_KIND_LONG_VARSIZE => {
-        if pos + 2 > data.len() {
-          return Err(bad);
-        }
-        2 + data[pos] as usize + 256 * data[pos + 1] as usize
-      }
-      _ => attr.max_byte_size() as usize,
-    };
-    if pos + len > data.len() {
-      return Err(bad);
-    }
-    each(attr, Some(&data[pos..pos + len]))?;
-    pos += len;
+    packed.align(attr);
+    let fixed = attr.max_byte_size() as usize;
+    let len = stored_len(attr, fixed, packed.rest()?)?;
+    each(attr, Some(packed.take(len)?))?;
   }
-  Ok(1 + mask_words + pos.div_ceil(4))
+  Ok(packed.words())
 }
 
 /// The heads a read of blob columns of `table` brought, a packed row as

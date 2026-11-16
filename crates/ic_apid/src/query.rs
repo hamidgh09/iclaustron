@@ -465,13 +465,16 @@ impl ApidQuery {
     })
   }
 
-  /// A part operation of the driver's own, over a blob column's parts
-  /// table: its sections are built by the driver, so its rows are left
-  /// empty, and its records are the parts table's every column.
-  pub(crate) fn internal(parts: &Arc<TableDef>) -> Result<ApidQuery, IcError> {
-    let rec = Record::default_for(parts, None)?;
-    Ok(ApidQuery {
-      table: Arc::clone(parts),
+  /// An operation of the driver's own, over a blob column's parts table
+  /// or over the main table: its sections are built by the driver, and
+  /// what it reads the driver takes as it came, so its rows are left
+  /// empty and its records name no field. A record of the table's
+  /// every column, made and copied for each such operation, was never
+  /// looked at.
+  pub(crate) fn internal(table: &Arc<TableDef>) -> ApidQuery {
+    let rec = Record::empty(table);
+    ApidQuery {
+      table: Arc::clone(table),
       index: None,
       key_rec: rec.clone(),
       attr_rec: rec,
@@ -494,7 +497,7 @@ impl ApidQuery {
       blob_probe: false,
       blob_lock_first: false,
       execution: Execution::default(),
-    })
+    }
   }
 
   /// True for a part operation of the driver's own.

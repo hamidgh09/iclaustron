@@ -3089,12 +3089,13 @@ columns" is written from it. Found on the way:
 The tests are the integration group `blob`, beside unit tests of the
 head, the arithmetic, the planner and the commit held.
 
-### 12.10 The review of 1.1.0 (2026-11-13, open)
+### 12.10 The review of 1.1.0 (2026-11-13, done 2026-11-14)
 
 A review of everything between 1.0.0 and 1.1.0, each finding checked
-against the code. Fifteen held. The first eleven are fixed on `trunk`
-(2026-11-14), the first four and then the next seven; 1.1.0 itself
-takes no changes.
+against the code. Fifteen held, and all are fixed on `trunk`
+(2026-11-14), in three steps: the first four, the next seven, and the
+last four, which change what the client spends and nothing it does;
+1.1.0 itself takes no changes.
 
 1. **The unlock went with the first round of parts**, not after the
    last: in a transaction left open, a value with more part data than
@@ -3196,14 +3197,55 @@ buffer no column holds. The seventh has no test against a cluster, for
 want of a way to write such a head, and the eighth none of a helper
 outliving its first wait, which needs a coordinator that says it runs.
 
-Still open, in the order found:
+12. **A transaction's bookkeeping of its BLOB queries was quadratic
+    in their number.** Each one starting looked at every one running
+    for whom to wait for, each one ending at every one for who waited
+    for it, with a copy of the list, and every send at every one for a
+    committed read to decide: a thousand in one transaction took about
+    a million looks. The transaction now keeps them by table
+    and by row (`RunBook`): a query finds the latest on its row by a
+    word made of its key words, each one knows who waits for it, and
+    the committed reads that wait for the send are a list of their
+    own. A query whose row is not known by its key becomes its table's
+    barrier: it waits for the latest on each row and takes those rows
+    over, and every later one waits for it, so that a run of such
+    queries waits for one each where each waited for all before it.
+    Two rows whose key words give one word are taken for one row, and
+    the later waits. The rows are a list in the order they came, and a
+    hash map says only where in the list each is: a hash map's own
+    order changes from one run of the program to the next, so it is
+    never walked (chapter 07), and the barrier waits for its rows in
+    the same order every time. What a transaction kept is used by the
+    next, so that a transaction of one BLOB query allocates nothing
+    for it.
+13. **Each operation of a run built and copied a record it never
+    used**, of its table's every column: once for each part operation
+    and each main row operation a query made. They now have a record
+    of no fields.
+14. **`walk_packed` was a second parser of the packed row**, beside
+    the one that unpacks a row by a record. `PackedRow` in `row_codec`
+    is now the one parser of that layout, the mask and where each
+    value starts; the two differ only in what they do with a value.
+15. **Every send looked each query up five times**, and its
+    transaction once for each: whether it was packed, twice, whether
+    it was a committed read, and twice to send it. A query is now
+    looked up once as it goes, the last request of the batch is found
+    from its end, and the transaction is looked up once for the batch.
+    A branch for a query that could not be sent, which nothing could
+    reach, is gone.
 
-12. A transaction's bookkeeping of its BLOB queries is quadratic in
-    their number.
-13. Each part operation's slot builds and copies a record it never
-    uses.
-14. `walk_packed` is a second parser of the packed row.
-15. Every send looks each query up three times more than it needs to.
+Tests for these: unit tests of `RunBook`, for rows, barriers, a row
+left and what is kept for the next transaction; the rest is covered by
+what already tested it, the packed row by its unit tests and its fuzz
+target, the order of queries on a row by the three integration tests
+of the first step, and the send by every test that sends. No rate was
+measured again: the first three change BLOB queries only, and the last
+saves looks, not requests.
+
+One thing seen and left: `leave_transaction` walks its transaction's
+whole list of sent queries for each one that completes, in every
+transaction and since 1.0, so that a batch of 500 costs some 125 000
+compares. It is not of this review's range.
 
 ### Not in this phase
 

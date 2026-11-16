@@ -347,41 +347,8 @@ pub(crate) fn unpack_row_with(
   if row.len() < rec.row_size() as usize {
     return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
   }
-  let header = match words.first() {
-    Some(header) => *header,
-    None => return Err(bad),
-  };
-  if column_header::column_id(header) != IC_COL_READ_MASKED {
-    return Err(bad);
-  }
-  let mask_words = (column_header::byte_size(header) / 4) as usize;
-  if words.len() < 1 + mask_words {
-    return Err(bad);
-  }
-  let mask = &words[1..1 + mask_words];
-  let data = words_as_bytes(&words[1 + mask_words..]);
-  let total_bits = 32 * mask_words;
-  // Where the next value starts: a byte, and a bit within the word that
-  // bit columns are being packed into.
-  let mut pos: usize = 0;
-  let mut bit_pos: usize = 0;
-  let mut bit: usize = 0;
-  let mut attr_id: u32 = 0;
-  while bit < total_bits {
-    // A column not read takes one bit, so a run of zero bits is as many
-    // columns skipped: jump over the run within its word at once rather
-    // than bit by bit.
-    let rest = mask[bit / 32] >> (bit % 32);
-    if rest == 0 {
-      let skip = 32 - bit % 32;
-      bit += skip;
-      attr_id += skip as u32;
-      continue;
-    }
-    let zeros = rest.trailing_zeros() as usize;
-    bit += zeros + 1;
-    let this_id = attr_id + zeros as u32;
-    attr_id = this_id + 1;
+  let mut packed = PackedRow::open(words)?;
+  while let Some(this_id) = packed.next_column() {
     let (attr, field, position) = match field_of(rec, this_id) {
       Some(found) => found,
       None => return Err(bad),
@@ -391,8 +358,7 @@ pub(crate) fn unpack_row_with(
       // byte array behind a 2-byte length, go to the values.
       let mut is_null = false;
       if attr.nullable {
-        is_null = bit < total_bits && mask_bit(mask, bit);
-        bit += 1;
+        is_null = packed.null();
       }
       let values = match blobs.as_deref_mut() {
         Some(values) => values,
@@ -402,25 +368,16 @@ pub(crate) fn unpack_row_with(
         values.read_head(position, None)?;
         continue;
       }
-      pos += 4 * bit_pos.div_ceil(32);
-      bit_pos = 0;
-      if pos + 2 > data.len() {
-        return Err(bad);
-      }
-      let len = 2 + data[pos] as usize + 256 * data[pos + 1] as usize;
-      if pos + len > data.len() {
-        return Err(bad);
-      }
+      packed.past_bits();
+      let len = long_len(packed.rest()?)?;
+      let value = packed.take(len)?;
       let sizes = values.sizes_at(position)?;
-      let (length, inline) =
-        blob::decode_main_value(sizes, &data[pos..pos + len])?;
+      let (length, inline) = blob::decode_main_value(sizes, value)?;
       values.read_head(position, Some((length, inline)))?;
-      pos += len;
       continue;
     }
     if attr.nullable {
-      let is_null = bit < total_bits && mask_bit(mask, bit);
-      bit += 1;
+      let is_null = packed.null();
       rec.set_null(row, position, is_null)?;
       if is_null {
         continue;
@@ -429,32 +386,193 @@ pub(crate) fn unpack_row_with(
     let start = field.offset() as usize;
     let size = field.size() as usize;
     if attr.size_bits_log2 == table_props::IC_COLUMN_SIZE_BIT {
-      pos = next_word(pos);
       let len = attr.array_len as usize;
-      copy_bits(data, pos, bit_pos, len, &mut row[start..start + size])?;
-      pos += 4 * ((bit_pos + len) / 32);
-      bit_pos = (bit_pos + len) % 32;
+      packed.bits(len, &mut row[start..start + size])?;
       continue;
     }
-    // Past the words bit columns have filled, then to a word for the
-    // wider types.
-    if attr.size_bits_log2 >= table_props::IC_COLUMN_SIZE_32 {
-      pos = next_word(pos);
-    }
-    pos += 4 * bit_pos.div_ceil(32);
-    bit_pos = 0;
-    if pos > data.len() {
-      return Err(bad);
-    }
-    let len = value_len(attr, field, &data[pos..])?;
-    if pos + len > data.len() {
-      return Err(bad);
-    }
-    row[start..start + len].copy_from_slice(&data[pos..pos + len]);
-    pos += len;
+    packed.align(attr);
+    let len = value_len(attr, field, packed.rest()?)?;
+    let value = packed.take(len)?;
+    row[start..start + len].copy_from_slice(value);
   }
-  let used = next_word(pos) + 4 * bit_pos.div_ceil(32);
-  Ok(1 + mask_words + used / 4)
+  Ok(packed.words())
+}
+
+/// A packed row, as a read by bitmask brings it back, walked a column
+/// at a time: a header for the mask, the mask, a bit for each column
+/// up to the last one read and one more after a nullable column read,
+/// set for NULL, then the values in column order. This is the one
+/// parser of that layout: [`unpack_row`] puts the values into a row by
+/// a record, and `blob::walk_packed` hands them out by the table's
+/// description, for the heads and parts a BLOB query's run reads.
+pub(crate) struct PackedRow<'a> {
+  mask: &'a [u32],
+  data: &'a [u8],
+  /// The next bit of the mask, and the id of the column it stands for.
+  bit: usize,
+  attr_id: u32,
+  /// Where the next value starts: a byte, and a bit within the word
+  /// that bit columns are being packed into.
+  pos: usize,
+  bit_pos: usize,
+}
+
+impl<'a> PackedRow<'a> {
+  /// The row in `words`, at its first column. A row that does not
+  /// begin with a mask whole is `IC_ERROR_INCONSISTENT_DATA`.
+  #[inline]
+  pub(crate) fn open(words: &'a [u32]) -> Result<PackedRow<'a>, IcError> {
+    let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
+    let header = match words.first() {
+      Some(header) => *header,
+      None => return Err(bad),
+    };
+    if column_header::column_id(header) != IC_COL_READ_MASKED {
+      return Err(bad);
+    }
+    let mask_words = (column_header::byte_size(header) / 4) as usize;
+    if words.len() < 1 + mask_words {
+      return Err(bad);
+    }
+    Ok(PackedRow {
+      mask: &words[1..1 + mask_words],
+      data: words_as_bytes(&words[1 + mask_words..]),
+      bit: 0,
+      attr_id: 0,
+      pos: 0,
+      bit_pos: 0,
+    })
+  }
+
+  /// The id of the next column the row holds, or `None` at its end.
+  #[inline]
+  pub(crate) fn next_column(&mut self) -> Option<u32> {
+    let total_bits = 32 * self.mask.len();
+    while self.bit < total_bits {
+      // A column not read takes one bit, so a run of zero bits is as
+      // many columns skipped: jump over the run within its word at once
+      // rather than bit by bit.
+      let rest = self.mask[self.bit / 32] >> (self.bit % 32);
+      if rest == 0 {
+        let skip = 32 - self.bit % 32;
+        self.bit += skip;
+        self.attr_id += skip as u32;
+        continue;
+      }
+      let zeros = rest.trailing_zeros() as usize;
+      self.bit += zeros + 1;
+      let id = self.attr_id + zeros as u32;
+      self.attr_id = id + 1;
+      return Some(id);
+    }
+    None
+  }
+
+  /// The bit after a nullable column's own, taken: true for NULL, whose
+  /// value is then not in the row.
+  #[inline]
+  pub(crate) fn null(&mut self) -> bool {
+    let total_bits = 32 * self.mask.len();
+    let is_null = self.bit < total_bits && mask_bit(self.mask, self.bit);
+    self.bit += 1;
+    is_null
+  }
+
+  /// To where a value that is no bit column starts: past the words bit
+  /// columns have filled.
+  #[inline]
+  pub(crate) fn past_bits(&mut self) {
+    self.pos += 4 * self.bit_pos.div_ceil(32);
+    self.bit_pos = 0;
+  }
+
+  /// To where the value of `attr`, no bit column, starts: on a word for
+  /// the wider types, a byte array on the next byte, and past the words
+  /// bit columns have filled.
+  #[inline]
+  pub(crate) fn align(&mut self, attr: &ColumnProps) {
+    if attr.size_bits_log2 >= table_props::IC_COLUMN_SIZE_32 {
+      self.pos = next_word(self.pos);
+    }
+    self.past_bits();
+  }
+
+  /// What is left of the row's values from where the next one starts.
+  #[inline]
+  pub(crate) fn rest(&self) -> Result<&'a [u8], IcError> {
+    match self.data.get(self.pos..) {
+      Some(rest) => Ok(rest),
+      None => Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA)),
+    }
+  }
+
+  /// The next `len` bytes, a value's, taken.
+  #[inline]
+  pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], IcError> {
+    let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
+    let end = match self.pos.checked_add(len) {
+      Some(end) => end,
+      None => return Err(bad),
+    };
+    match self.data.get(self.pos..end) {
+      Some(value) => {
+        self.pos = end;
+        Ok(value)
+      }
+      None => Err(bad),
+    }
+  }
+
+  /// A bit column's `len` bits, taken into `dest` from its first bit:
+  /// bit columns are packed into words of their own, one after another.
+  #[inline]
+  pub(crate) fn bits(
+    &mut self,
+    len: usize,
+    dest: &mut [u8],
+  ) -> Result<(), IcError> {
+    self.pos = next_word(self.pos);
+    copy_bits(self.data, self.pos, self.bit_pos, len, dest)?;
+    self.pos += 4 * ((self.bit_pos + len) / 32);
+    self.bit_pos = (self.bit_pos + len) % 32;
+    Ok(())
+  }
+
+  /// The words the row took, once every column has been taken.
+  #[inline]
+  pub(crate) fn words(&self) -> usize {
+    let used = next_word(self.pos) + 4 * self.bit_pos.div_ceil(32);
+    1 + self.mask.len() + used / 4
+  }
+}
+
+/// How many bytes a value kept behind a 2-byte length takes, the two
+/// bytes with it, from the bytes it starts at.
+#[inline]
+fn long_len(value: &[u8]) -> Result<usize, IcError> {
+  if value.len() < 2 {
+    return Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA));
+  }
+  Ok(2 + value[0] as usize + 256 * value[1] as usize)
+}
+
+/// How many bytes of `value` are a column's value as it is stored: its
+/// length bytes and the length they say for a variable-sized one,
+/// `fixed` for any other.
+#[inline]
+pub(crate) fn stored_len(
+  attr: &ColumnProps,
+  fixed: usize,
+  value: &[u8],
+) -> Result<usize, IcError> {
+  match attr.array_kind {
+    table_props::IC_ARRAY_KIND_SHORT_VARSIZE => match value.first() {
+      Some(n) => Ok(1 + *n as usize),
+      None => Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA)),
+    },
+    table_props::IC_ARRAY_KIND_LONG_VARSIZE => long_len(value),
+    _ => Ok(fixed),
+  }
 }
 
 /// The value at `position` of `row`, a row laid out by `rec`, as a
@@ -492,22 +610,7 @@ fn value_len(
   value: &[u8],
 ) -> Result<usize, IcError> {
   let size = field.size() as usize;
-  let short = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
-  let len = match attr.array_kind {
-    table_props::IC_ARRAY_KIND_SHORT_VARSIZE => {
-      if value.is_empty() {
-        return Err(short);
-      }
-      1 + value[0] as usize
-    }
-    table_props::IC_ARRAY_KIND_LONG_VARSIZE => {
-      if value.len() < 2 {
-        return Err(short);
-      }
-      2 + value[0] as usize + 256 * value[1] as usize
-    }
-    _ => size,
-  };
+  let len = stored_len(attr, size, value)?;
   if len > size {
     return Err(IcError::new(err::IC_ERROR_VALUE_TOO_LONG));
   }

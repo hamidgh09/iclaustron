@@ -110,6 +110,7 @@ use crate::apid_conn::Staged;
 use crate::apid_global::LinkStatus;
 use crate::blob::BlobColumn;
 use crate::blob_run;
+use crate::blob_run::RunBook;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
 use crate::hash;
@@ -233,9 +234,10 @@ pub struct Transaction {
   /// Its BLOB queries that plan a round after the one they have out: a
   /// commit asked for waits until none does (chapter 06, phase 12).
   blob_planning: u32,
-  /// Its BLOB queries whose runs go on, in the order they were defined:
-  /// one on a row another of them is on waits for it.
-  blob_runs: Vec<QueryId>,
+  /// Its BLOB queries whose runs go on, and the queries that wait
+  /// their turn behind them, by the rows they are on: one on a row
+  /// another of them is on waits for it.
+  pub(crate) blob: RunBook,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -337,21 +339,6 @@ impl Transaction {
   /// other defined.
   pub(crate) fn only_query(&self, qid: QueryId) -> bool {
     self.ops_sent == 0 && self.defined.len() == 1 && self.defined[0] == qid
-  }
-
-  /// Its BLOB queries whose runs go on, in the order they were defined.
-  pub(crate) fn blob_runs(&self) -> &[QueryId] {
-    &self.blob_runs
-  }
-
-  /// A BLOB query's run has started on it.
-  pub(crate) fn add_blob_run(&mut self, qid: QueryId) {
-    self.blob_runs.push(qid);
-  }
-
-  /// A BLOB query's run has ended.
-  pub(crate) fn remove_blob_run(&mut self, qid: QueryId) {
-    self.blob_runs.retain(|other| *other != qid);
   }
 
   /// A query that waited its turn behind a BLOB query on its row goes
@@ -692,7 +679,7 @@ impl ApidConnection {
       last_sent: 0,
       heard_at: 0,
       blob_planning: 0,
-      blob_runs: Vec::new(),
+      blob: RunBook::default(),
     };
     let id = TransId(self.transactions.insert(trans)?);
     self.active_insert(coord.index, id);
@@ -747,13 +734,18 @@ impl ApidConnection {
       return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE));
     }
     // Its two lists are kept, emptied, for the next transaction, rather
-    // than freed and allocated again.
+    // than freed and allocated again, and so is what it kept of its
+    // BLOB queries, if it had any.
     if let Some(mut trans) = self.transactions.remove(id.0) {
       if self.spare_lists.len() < IC_SPARE_QUERY_LISTS {
         trans.defined.clear();
         trans.sent.clear();
         self.spare_lists.push(std::mem::take(&mut trans.defined));
         self.spare_lists.push(std::mem::take(&mut trans.sent));
+      }
+      if trans.blob.has_room() && self.spare_books.len() < IC_SPARE_RUN_BOOKS {
+        trans.blob.clear();
+        self.spare_books.push(std::mem::take(&mut trans.blob));
       }
     }
     Ok(())
@@ -926,7 +918,7 @@ impl ApidConnection {
     let mut flags = flags;
     let (id, coord, has_runs) = match self.transactions.get(trans_id.0) {
       Some(trans) if trans.is_open() => {
-        (trans.trans_id, trans.coord, !trans.blob_runs.is_empty())
+        (trans.trans_id, trans.coord, !trans.blob.is_empty())
       }
       _ => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
     };
@@ -1011,7 +1003,6 @@ impl ApidConnection {
       let mut key = std::mem::take(&mut self.key_scratch);
       let taken = blob_run::row_taken(
         &self.transactions,
-        &self.queries,
         trans_id,
         query,
         any_row,
@@ -1367,11 +1358,15 @@ impl ApidConnection {
       };
     let commit_now = end_wanted == Some(CommitState::CommitRequested) && !held;
     // A BLOB query goes on no wire: its run's operations carry it, and
-    // the batch's flags go on theirs.
+    // the batch's flags go on theirs. The last request of the batch is
+    // looked for from its end, where it nearly always is.
     let mut last_packed: Option<usize> = None;
-    for (index, qid) in defined.iter().enumerate() {
-      if self.is_packed(*qid) {
-        last_packed = Some(index);
+    let mut at = defined.len();
+    while at > 0 {
+      at -= 1;
+      if self.is_packed(defined[at]) {
+        last_packed = Some(at);
+        break;
       }
     }
     // The start flag goes on the batch's first request while the
@@ -1381,59 +1376,33 @@ impl ApidConnection {
     // commit or a rollback ends it here.
     let mut begun = begun;
     let mut start = !begun;
-    let mut i: usize = 0;
-    while i < defined.len() {
-      let qid = defined[i];
+    for (i, qid) in defined.iter().enumerate() {
       let last = Some(i) == last_packed;
-      i += 1;
-      if !self.is_packed(qid) {
-        if let Some(query) = self.queries.get_mut(qid.0) {
-          query.set_state(QueryState::Sent);
-        }
-        if let Some(trans) = self.transactions.get_mut(id.0) {
-          trans.sent.push(qid);
-          trans.ops_sent += 1;
-        }
-        continue;
-      }
-      let committed_read = match self.queries.get(qid.0) {
-        Some(query) => query.execution.flags.dirty,
-        None => false,
-      };
-      let sent = self.send_query(qid, start, last, last && commit_now);
-      match sent {
-        Ok(()) => {
-          start = false;
-          if !committed_read {
-            begun = true;
-          }
-          if let Some(trans) = self.transactions.get_mut(id.0) {
-            trans.begun = begun;
-            trans.sent.push(qid);
-            trans.ops_sent += 1;
-            if last && commit_now {
-              trans.state = CommitState::CommitRequested;
-              trans.end_wanted = None;
-            }
-          }
-        }
-        Err(e) => {
-          // The rest of the batch is not sent; the queries fail here.
-          let rest = &defined[i - 1..];
-          for qid in rest {
-            self.unstage_query(*qid);
-          }
-          self.fail_in_order(rest, e, 0);
-          return Err(e);
+      // Each query is looked up once, as it goes.
+      if let Some(committed_read) =
+        self.send_query(*qid, start, last, last && commit_now)
+      {
+        start = false;
+        if !committed_read {
+          begun = true;
         }
       }
     }
-    // The list goes back, emptied, for the next queries defined, rather
+    // The transaction is looked up once for the batch: every query of
+    // it is sent now, and the commit went if a request carried it. The
+    // list goes back, emptied, for the next queries defined, rather
     // than being dropped and allocated again.
     let mut defined = defined;
-    defined.clear();
     let end = match self.transactions.get_mut(id.0) {
       Some(trans) => {
+        trans.begun = begun;
+        trans.sent.extend_from_slice(&defined);
+        trans.ops_sent += defined.len() as u32;
+        if commit_now && last_packed.is_some() {
+          trans.state = CommitState::CommitRequested;
+          trans.end_wanted = None;
+        }
+        defined.clear();
         if trans.defined.is_empty() && trans.defined.capacity() == 0 {
           trans.defined = defined;
         }
@@ -1545,32 +1514,34 @@ impl ApidConnection {
     self.unstage(&staged);
   }
 
-  /// One query's request.
+  /// One query of a batch goes, the query looked up once: it is sent
+  /// from here on, and its request, packed when it was defined, is
+  /// given its place in the batch. `None` for a query with nothing
+  /// packed, a BLOB query or one that waits its turn behind one, which
+  /// goes on no wire; else whether the request is a committed read,
+  /// which begins no transaction at the coordinator.
   fn send_query(
     &mut self,
     qid: QueryId,
     start: bool,
     execute: bool,
     commit: bool,
-  ) -> Result<(), IcError> {
-    let (mut flags, staged) = match self.queries.get(qid.0) {
-      Some(query) => (query.execution.flags, query.execution.staged),
-      None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
-    };
-    // The request was packed when the query was defined; only its
-    // place in the batch is set now.
+  ) -> Option<bool> {
+    let query = self.queries.get_mut(qid.0)?;
+    query.set_state(QueryState::Sent);
+    let staged = std::mem::take(&mut query.execution.staged);
+    if staged.len == 0 {
+      return None;
+    }
+    if query.execution.is_read {
+      query.execution.sent_at = ic_port::time::gethrtime();
+    }
+    let mut flags = query.execution.flags;
     flags.start = start;
     flags.execute = execute;
     flags.commit = commit;
     self.patch_staged(&staged, IC_KEY_OP_REQ_REQUEST_INFO, flags.flags_word());
-    if let Some(query) = self.queries.get_mut(qid.0) {
-      query.execution.staged = Staged::default();
-      if query.execution.is_read {
-        query.execution.sent_at = ic_port::time::gethrtime();
-      }
-      query.set_state(QueryState::Sent);
-    }
-    Ok(())
+    Some(flags.dirty)
   }
 
   /// A commit or rollback that could ride on no query.
@@ -2493,6 +2464,9 @@ impl ApidConnection {
 /// Emptied query lists a connection keeps for its next transactions;
 /// enough for a few thousand in flight, beyond which they are freed.
 const IC_SPARE_QUERY_LISTS: usize = 8192;
+/// What transactions closed kept of their BLOB queries, emptied, for
+/// the next ones that have any: as many as may well be open at once.
+const IC_SPARE_RUN_BOOKS: usize = 1024;
 
 /// How much longer than a transaction's own wait for replies a
 /// synchronous helper waits for it to end: the reply timeout is looked
@@ -2778,7 +2752,7 @@ mod tests {
       last_sent: 0,
       heard_at: 0,
       blob_planning: 0,
-      blob_runs: Vec::new(),
+      blob: RunBook::default(),
     };
     assert!(!trans.is_done());
     trans.state = CommitState::Committed;
@@ -2807,7 +2781,7 @@ mod tests {
       last_sent,
       heard_at: 0,
       blob_planning: 0,
-      blob_runs: Vec::new(),
+      blob: RunBook::default(),
     }
   }
 

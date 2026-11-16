@@ -50,7 +50,9 @@
 //!   a BLOB query is at its row waits its turn too, its request built
 //!   at once and sent when its turn comes (`BlobRun::plain`). A query
 //!   through a unique index, and a takeover of a scanned row, whose row
-//!   is not known by its key, wait for every one on the table.
+//!   is not known by its key, wait for every one on the table. Who runs
+//!   on which row is kept by the transaction ([`RunBook`]), so that
+//!   a query finds whom it waits for, and who waits for it, at once.
 //! - **A part is written with the write operation**, aborting on error,
 //!   so that a part that fails rolls the transaction back. Its key is
 //!   the main row's key words and the part number; its columns the main
@@ -75,6 +77,11 @@
 //!   a failure once the main row's write has gone in, so that a value
 //!   is never committed without its parts.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use ic_port::err;
@@ -190,6 +197,266 @@ struct OpReq<'a> {
   dist_key: Option<u32>,
 }
 
+/// A transaction's BLOB queries still running, and with them the
+/// queries with no blob value that wait their turn behind one: who runs
+/// on which row, kept so that a query starting or ending takes the same
+/// few steps however many run beside it (chapter 06, 12.10, item 12).
+///
+/// A query on a row known by its key waits for the latest still running
+/// on that row, which waited for those before it. A query whose row is
+/// not known by its key, through a unique index or a scanned row taken
+/// over, waits for every one on its table, and every later one on the
+/// table waits for it: it is the table's `barrier`, and takes the rows
+/// before it over, so that each query is waited for by name once.
+///
+/// A row is named by a word made of its key words ([`row_word`]). Two
+/// rows of one table with the same word are taken for one row: the
+/// later query on them waits for the earlier, which costs a round and
+/// harms nothing.
+///
+/// A query that still waits leaves early only as its transaction stops
+/// taking rounds, so that those it let go before their turn send
+/// nothing.
+#[derive(Default)]
+pub(crate) struct RunBook {
+  /// How many run.
+  running: u32,
+  /// Those running, by table: a transaction's tables are few.
+  tables: Vec<TableRuns>,
+  /// Committed reads whose first round waits for their transaction's
+  /// send, which decides how they read.
+  undecided: Vec<QueryId>,
+}
+
+/// The queries of a transaction still running on one table.
+#[derive(Default)]
+struct TableRuns {
+  table_id: u32,
+  /// How many run on the table.
+  running: u32,
+  /// The latest still running on each row since the barrier started,
+  /// in the order the rows came but for those that have left: walked
+  /// by a query that takes them over, so that the order it waits for
+  /// them in is the same from one run of the program to the next.
+  latest: Vec<RowRun>,
+  /// Where in `latest` a row is, by its word. Never walked: the order
+  /// of a hash map is not one to depend on.
+  rows: HashMap<u64, usize>,
+  /// The latest still running whose row is not known by its key.
+  barrier: Option<QueryId>,
+}
+
+/// The latest query still running on a row.
+struct RowRun {
+  row: u64,
+  qid: QueryId,
+}
+
+impl RunBook {
+  /// True while no query of the transaction runs.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.running == 0
+  }
+
+  /// True if a query of the transaction runs on the table.
+  pub(crate) fn runs_on(&self, table_id: u32) -> bool {
+    match self.place(table_id) {
+      Some(at) => self.tables[at].running > 0,
+      None => false,
+    }
+  }
+
+  /// True if a query about to be defined on `row` of the table, `None`
+  /// for a row not known by its key, has to wait its turn: one runs on
+  /// that row, or one whose row is not known by its key on the table;
+  /// and for such a query itself, any at all on the table.
+  pub(crate) fn taken(&self, table_id: u32, row: Option<u64>) -> bool {
+    let table = match self.place(table_id) {
+      Some(at) if self.tables[at].running > 0 => &self.tables[at],
+      _ => return false,
+    };
+    match row {
+      Some(row) => table.barrier.is_some() || table.rows.contains_key(&row),
+      None => true,
+    }
+  }
+
+  /// A query starts to run on `row` of the table, `None` for a row not
+  /// known by its key: those it waits for into `after`, emptied first,
+  /// and the query entered as the latest on its row, or as its table's
+  /// barrier.
+  pub(crate) fn enter(
+    &mut self,
+    qid: QueryId,
+    table_id: u32,
+    row: Option<u64>,
+    after: &mut Vec<QueryId>,
+  ) {
+    after.clear();
+    let at = self.place_for(table_id);
+    let table = &mut self.tables[at];
+    match row {
+      Some(row) => match table.rows.entry(row) {
+        Entry::Occupied(place) => {
+          let earlier = &mut table.latest[*place.get()];
+          after.push(earlier.qid);
+          earlier.qid = qid;
+        }
+        Entry::Vacant(place) => {
+          if let Some(barrier) = table.barrier {
+            after.push(barrier);
+          }
+          place.insert(table.latest.len());
+          table.latest.push(RowRun { row, qid });
+        }
+      },
+      None => {
+        if let Some(barrier) = table.barrier {
+          after.push(barrier);
+        }
+        for earlier in table.latest.drain(..) {
+          after.push(earlier.qid);
+        }
+        table.rows.clear();
+        table.barrier = Some(qid);
+      }
+    }
+    table.running += 1;
+    self.running += 1;
+  }
+
+  /// A query entered has ended, or could not start after all.
+  pub(crate) fn leave(
+    &mut self,
+    qid: QueryId,
+    table_id: u32,
+    row: Option<u64>,
+  ) {
+    let table = match self.place(table_id) {
+      Some(at) if self.tables[at].running > 0 => &mut self.tables[at],
+      _ => return,
+    };
+    match row {
+      Some(row) => table.leave_row(qid, row),
+      None => {
+        if table.barrier == Some(qid) {
+          table.barrier = None;
+        }
+      }
+    }
+    table.running -= 1;
+    if table.running == 0 {
+      // No query runs on the table: nothing of it is kept.
+      table.latest.clear();
+      table.rows.clear();
+      table.barrier = None;
+    }
+    self.running = self.running.saturating_sub(1);
+  }
+
+  /// A committed read's first round waits for its transaction's send.
+  pub(crate) fn wait_for_send(&mut self, qid: QueryId) {
+    self.undecided.push(qid);
+  }
+
+  /// True if a committed read waits for the send.
+  pub(crate) fn has_undecided(&self) -> bool {
+    !self.undecided.is_empty()
+  }
+
+  /// The committed reads that waited for the send, which is now: taken
+  /// out, for the list to be given back emptied.
+  pub(crate) fn take_undecided(&mut self) -> Vec<QueryId> {
+    std::mem::take(&mut self.undecided)
+  }
+
+  /// The list [`take_undecided`](Self::take_undecided) gave, back for
+  /// its room, unless reads have waited since.
+  pub(crate) fn give_back(&mut self, list: Vec<QueryId>) {
+    if self.undecided.capacity() == 0 {
+      self.undecided = list;
+      self.undecided.clear();
+    }
+  }
+
+  /// Emptied for the next transaction, the room it has made kept.
+  pub(crate) fn clear(&mut self) {
+    self.running = 0;
+    for table in &mut self.tables {
+      table.running = 0;
+      table.latest.clear();
+      table.rows.clear();
+      table.barrier = None;
+    }
+    self.undecided.clear();
+  }
+
+  /// True if it has made room worth keeping for another transaction.
+  pub(crate) fn has_room(&self) -> bool {
+    !self.tables.is_empty() || self.undecided.capacity() > 0
+  }
+
+  /// Where the table's queries are kept, if any have run on it.
+  fn place(&self, table_id: u32) -> Option<usize> {
+    let mut at: usize = 0;
+    while at < self.tables.len() {
+      if self.tables[at].table_id == table_id {
+        return Some(at);
+      }
+      at += 1;
+    }
+    None
+  }
+
+  /// Where the table's queries are kept, a place made for it if none
+  /// has run on it: one no table's queries run in any more, or a new
+  /// one.
+  fn place_for(&mut self, table_id: u32) -> usize {
+    if let Some(at) = self.place(table_id) {
+      return at;
+    }
+    let mut at: usize = 0;
+    while at < self.tables.len() {
+      if self.tables[at].running == 0 {
+        self.tables[at].table_id = table_id;
+        return at;
+      }
+      at += 1;
+    }
+    self.tables.push(TableRuns {
+      table_id,
+      ..TableRuns::default()
+    });
+    self.tables.len() - 1
+  }
+}
+
+impl TableRuns {
+  /// A query on `row` has ended: the row is forgotten if it was the
+  /// latest on it, the last of `latest` moved into its place.
+  fn leave_row(&mut self, qid: QueryId, row: u64) {
+    let at = match self.rows.get(&row) {
+      Some(&at) if self.latest[at].qid == qid => at,
+      _ => return,
+    };
+    self.rows.remove(&row);
+    self.latest.swap_remove(at);
+    if let Some(moved) = self.latest.get(at) {
+      if let Some(place) = self.rows.get_mut(&moved.row) {
+        *place = at;
+      }
+    }
+  }
+}
+
+/// The word a row is named by in a [`RunBook`], made of its key words
+/// as a request carries them: the same for the same row.
+pub(crate) fn row_word(key: &[u32]) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  key.hash(&mut hasher);
+  hasher.finish()
+}
+
 /// The run of a BLOB query's rounds (chapter 06, phase 12), kept with
 /// the query from one execution to the next.
 pub(crate) struct BlobRun {
@@ -197,8 +464,15 @@ pub(crate) struct BlobRun {
   active: bool,
   /// The earlier queries of the transaction still running on the same
   /// row, whose end the first round waits for: the latest of them, or
-  /// every one on the table when the row is not known by its key.
+  /// those a query whose row is not known by its key waits for on its
+  /// table ([`RunBook`]).
   after: Vec<QueryId>,
+  /// The later queries that wait for this one's end, each of which has
+  /// it in its `after`: told when it ends, with no search for them.
+  waiters: Vec<QueryId>,
+  /// The row the run is entered on in its transaction's [`RunBook`],
+  /// `None` when it is not known by its key.
+  row: Option<u64>,
   /// A query with no blob value, defined while a BLOB query of its
   /// transaction was at its row: it has no rounds, only its turn to
   /// wait for, and then goes as it would have at first, its request
@@ -309,6 +583,8 @@ impl BlobRun {
     BlobRun {
       active: false,
       after: Vec::new(),
+      waiters: Vec::new(),
+      row: None,
       plain: false,
       takeover: None,
       started: false,
@@ -848,7 +1124,7 @@ impl ApidConnection {
       Some(taken) => taken,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
-    self.blob_predecessors(tid, &mut run);
+    self.enter_run(qid, tid, &mut run);
     run.active = true;
     let waits = !run.after.is_empty();
     let mut defined: Result<(), IcError> = Ok(());
@@ -874,10 +1150,17 @@ impl ApidConnection {
     if run.plain && !waits && defined.is_ok() {
       self.blob_due.push(qid);
     }
+    let table_id = run.main_table.table_id();
+    let row = run.row;
+    // A committed read with no one to wait for waits for the send.
+    let for_send = run.undecided && !waits;
     self.put_run(qid, run, values);
     if let Some(trans) = self.transactions.get_mut(tid.0) {
-      if defined.is_ok() {
-        trans.add_blob_run(qid);
+      if defined.is_err() {
+        // It does not run after all, and no one waits for it yet.
+        trans.blob.leave(qid, table_id, row);
+      } else if for_send {
+        trans.blob.wait_for_send(qid);
       }
       if hold {
         trans.hold_commit();
@@ -886,18 +1169,66 @@ impl ApidConnection {
     defined
   }
 
+  /// Enter a run among those of `tid` ([`RunBook`]): whom it waits for
+  /// into its `after`, each of them told that it does, so that their
+  /// end finds it.
+  fn enter_run(&mut self, qid: QueryId, tid: TransId, run: &mut BlobRun) {
+    run.waiters.clear();
+    run.after.clear();
+    run.row = None;
+    if !run.any_row() {
+      run.row = Some(row_word(&run.main_key));
+    }
+    let table_id = run.main_table.table_id();
+    if let Some(trans) = self.transactions.get_mut(tid.0) {
+      // Its first: what a transaction closed kept is used again, if
+      // there is any, so that nothing is allocated for it.
+      if !trans.blob.has_room() {
+        if let Some(spare) = self.spare_books.pop() {
+          trans.blob = spare;
+        }
+      }
+      trans.blob.enter(qid, table_id, run.row, &mut run.after);
+    }
+    let mut i: usize = 0;
+    while i < run.after.len() {
+      let mut told = false;
+      if let Some(query) = self.queries.get_mut(run.after[i].0) {
+        if let Some(earlier) = query.run.as_mut() {
+          if earlier.active {
+            earlier.waiters.push(qid);
+            told = true;
+          }
+        }
+      }
+      // One that does not run is not waited for.
+      if told {
+        i += 1;
+      } else {
+        run.after.swap_remove(i);
+      }
+    }
+  }
+
   /// Plan the first round of each committed BLOB read of `tid` that
   /// waits for its send: read committed first when it is the
   /// transaction's only operation, else the lock taken first, its
   /// commit held. A round that cannot be defined fails its query.
   pub(crate) fn decide_blob_reads(&mut self, tid: TransId) {
-    let runs = match self.transactions.get(tid.0) {
-      Some(trans) if !trans.blob_runs().is_empty() => {
-        trans.blob_runs().to_vec()
-      }
+    let runs = match self.transactions.get_mut(tid.0) {
+      Some(trans) if trans.blob.has_undecided() => trans.blob.take_undecided(),
       _ => return,
     };
+    self.decide_each(tid, &runs);
+    if let Some(trans) = self.transactions.get_mut(tid.0) {
+      trans.blob.give_back(runs);
+    }
+  }
+
+  /// [`decide_blob_reads`](Self::decide_blob_reads) for each of `runs`.
+  fn decide_each(&mut self, tid: TransId, runs: &[QueryId]) {
     for qid in runs {
+      let qid = *qid;
       let waiting = match self.queries.get(qid.0) {
         Some(query) => match &query.run {
           Some(run) => run.active && run.undecided && run.after.is_empty(),
@@ -944,44 +1275,6 @@ impl ApidConnection {
           self.finish_query(qid);
         }
       }
-    }
-  }
-
-  /// Whom `run` waits for, into its `after`: the queries of `tid` still
-  /// running on the row it is for, one table and the same key words.
-  /// The latest of them is enough, since it waited for those before it;
-  /// but a run whose row is not known by its key
-  /// ([`any_row`](BlobRun::any_row)) keeps its order with every query
-  /// on its table, and those run beside each other: it waits for each.
-  fn blob_predecessors(&self, tid: TransId, run: &mut BlobRun) {
-    run.after.clear();
-    let trans = match self.transactions.get(tid.0) {
-      Some(trans) => trans,
-      None => return,
-    };
-    let any_row = run.any_row();
-    let mut latest: Option<QueryId> = None;
-    for other in trans.blob_runs() {
-      let earlier = match self.queries.get(other.0) {
-        Some(query) => match &query.run {
-          Some(earlier) => earlier,
-          None => continue,
-        },
-        None => continue,
-      };
-      if !earlier.active
-        || earlier.main_table.table_id() != run.main_table.table_id()
-      {
-        continue;
-      }
-      if any_row {
-        run.after.push(*other);
-      } else if earlier.any_row() || earlier.main_key == run.main_key {
-        latest = Some(*other);
-      }
-    }
-    if let Some(latest) = latest {
-      run.after.push(latest);
     }
   }
 
@@ -1312,7 +1605,7 @@ impl ApidConnection {
         return Ok(id);
       }
     }
-    let id = self.insert_query(ApidQuery::internal(&run.main_table)?)?;
+    let id = self.insert_query(ApidQuery::internal(&run.main_table))?;
     run.main_ops.push(id);
     run.main_cursor = run.main_ops.len();
     Ok(id)
@@ -1331,7 +1624,7 @@ impl ApidConnection {
       Some(parts) => parts,
       None => return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED)),
     };
-    let id = self.insert_query(ApidQuery::internal(parts)?)?;
+    let id = self.insert_query(ApidQuery::internal(parts))?;
     column.ops.push(id);
     column.cursor = column.ops.len();
     Ok(id)
@@ -1605,43 +1898,53 @@ impl ApidConnection {
   /// query on the same row waiting for it starts with the next poll,
   /// and the commit it held may go once no other holds it.
   pub(crate) fn end_blob_run(&mut self, qid: QueryId) {
-    let (tid, held) = match self.queries.get_mut(qid.0) {
-      Some(query) => {
-        let tid = query.execution.trans;
-        match query.run.as_mut() {
-          Some(run) if run.active => {
-            run.active = false;
-            run.after.clear();
-            run.ops_out = 0;
-            let held = run.holds_commit;
-            run.holds_commit = false;
-            (tid, held)
+    let (tid, held, table_id, row, mut waiters) =
+      match self.queries.get_mut(qid.0) {
+        Some(query) => {
+          let tid = query.execution.trans;
+          match query.run.as_mut() {
+            Some(run) if run.active => {
+              run.active = false;
+              run.after.clear();
+              run.ops_out = 0;
+              let held = run.holds_commit;
+              run.holds_commit = false;
+              let table_id = run.main_table.table_id();
+              let waiters = std::mem::take(&mut run.waiters);
+              (tid, held, table_id, run.row, waiters)
+            }
+            _ => return,
           }
-          _ => return,
         }
-      }
-      None => return,
-    };
+        None => return,
+      };
     let tid = match tid {
       Some(tid) => tid,
       None => return,
     };
-    let waiting = match self.transactions.get_mut(tid.0) {
-      Some(trans) => {
-        trans.remove_blob_run(qid);
-        trans.blob_runs().to_vec()
-      }
-      None => Vec::new(),
-    };
-    for other in waiting {
+    if let Some(trans) = self.transactions.get_mut(tid.0) {
+      trans.blob.leave(qid, table_id, row);
+    }
+    // Those that wait for it are the ones it was told of: no other
+    // query of the transaction is looked at.
+    for other in &waiters {
       if let Some(query) = self.queries.get_mut(other.0) {
         if let Some(run) = query.run.as_mut() {
           // The last it waited for: its turn has come.
           let waited = run.after.len();
           run.after.retain(|earlier| *earlier != qid);
           if waited > 0 && run.after.is_empty() {
-            self.blob_due.push(other);
+            self.blob_due.push(*other);
           }
+        }
+      }
+    }
+    // The list goes back, emptied, for its room.
+    if waiters.capacity() > 0 {
+      waiters.clear();
+      if let Some(query) = self.queries.get_mut(qid.0) {
+        if let Some(run) = query.run.as_mut() {
+          run.waiters = waiters;
         }
       }
     }
@@ -1930,46 +2233,30 @@ impl ApidConnection {
 /// `tid`, has to wait its turn: a BLOB query of the transaction is still
 /// running on the row it names, or on its table when `any_row` says its
 /// row is not known by its key, as through a unique index and for a
-/// scanned row taken over. Only asked for a transaction with such
-/// queries running and a table with blob columns. The query's key words
-/// are built in `key` if a run has to be told from it by its row.
+/// scanned row taken over ([`RunBook::taken`]). Only asked for a
+/// transaction with such queries running and a table with blob columns.
+/// The query's key words are built in `key` if one runs on its table
+/// and its row has to be named.
 pub(crate) fn row_taken(
   transactions: &PtrArray<Transaction>,
-  queries: &PtrArray<ApidQuery>,
   tid: TransId,
   query: &ApidQuery,
   any_row: bool,
   key: &mut Vec<u32>,
 ) -> Result<bool, IcError> {
-  let trans = match transactions.get(tid.0) {
-    Some(trans) => trans,
+  let book = match transactions.get(tid.0) {
+    Some(trans) => &trans.blob,
     None => return Ok(false),
   };
   let table_id = query.table().table_id();
-  let mut keyed = false;
-  for other in trans.blob_runs() {
-    let earlier = match queries.get(other.0) {
-      Some(holder) => match &holder.run {
-        Some(earlier) => earlier,
-        None => continue,
-      },
-      None => continue,
-    };
-    if !earlier.active || earlier.main_table.table_id() != table_id {
-      continue;
-    }
-    if any_row || earlier.any_row() {
-      return Ok(true);
-    }
-    if !keyed {
-      row_codec::key_info_into(query.key_record(), query.key_row(), key)?;
-      keyed = true;
-    }
-    if earlier.main_key == *key {
-      return Ok(true);
-    }
+  if !book.runs_on(table_id) {
+    return Ok(false);
   }
-  Ok(false)
+  if any_row {
+    return Ok(book.taken(table_id, None));
+  }
+  row_codec::key_info_into(query.key_record(), query.key_row(), key)?;
+  Ok(book.taken(table_id, Some(row_word(key))))
 }
 
 /// The buffers a round's requests are built in, the connection's own,
@@ -2046,6 +2333,166 @@ fn copy_part(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use ic_util::ptr_array::PtrId;
+
+  /// A query's id, for the tests of the book.
+  fn q(n: u64) -> QueryId {
+    QueryId(PtrId::from_u64(n))
+  }
+
+  #[test]
+  fn queries_on_one_row_wait_for_the_latest_on_it() {
+    let mut book = RunBook::default();
+    let mut after: Vec<QueryId> = Vec::new();
+    let (row_a, row_b) = (row_word(&[1]), row_word(&[2]));
+    assert_ne!(row_a, row_b);
+    assert_eq!(row_a, row_word(&[1]), "the same word for the same row");
+    assert!(book.is_empty());
+    assert!(!book.taken(7, Some(row_a)));
+    // Two rows of one table: neither query waits.
+    book.enter(q(1), 7, Some(row_a), &mut after);
+    assert!(after.is_empty());
+    book.enter(q(2), 7, Some(row_b), &mut after);
+    assert!(after.is_empty());
+    assert!(book.taken(7, Some(row_a)) && book.taken(7, Some(row_b)));
+    assert!(!book.taken(7, Some(row_word(&[3]))), "a row no query is on");
+    assert!(!book.taken(8, Some(row_a)), "another table's row");
+    assert!(book.taken(7, None), "any query on the table is in the way");
+    assert!(!book.taken(8, None));
+    // A second on row a waits for the first, a third for the second.
+    book.enter(q(3), 7, Some(row_a), &mut after);
+    assert_eq!(after, [q(1)]);
+    book.enter(q(4), 7, Some(row_a), &mut after);
+    assert_eq!(after, [q(3)]);
+    // The first two end: the row is still the latest's.
+    book.leave(q(1), 7, Some(row_a));
+    book.leave(q(3), 7, Some(row_a));
+    assert!(book.taken(7, Some(row_a)));
+    book.enter(q(5), 7, Some(row_a), &mut after);
+    assert_eq!(after, [q(4)]);
+    book.leave(q(4), 7, Some(row_a));
+    book.leave(q(5), 7, Some(row_a));
+    assert!(!book.taken(7, Some(row_a)));
+    assert!(book.taken(7, Some(row_b)));
+    book.leave(q(2), 7, Some(row_b));
+    assert!(book.is_empty());
+    assert!(!book.runs_on(7));
+  }
+
+  #[test]
+  fn a_query_on_a_row_not_known_by_its_key_waits_for_each_once() {
+    let mut book = RunBook::default();
+    let mut after: Vec<QueryId> = Vec::new();
+    let (row_a, row_b) = (row_word(&[1]), row_word(&[2]));
+    book.enter(q(1), 7, Some(row_a), &mut after);
+    book.enter(q(2), 7, Some(row_a), &mut after);
+    book.enter(q(3), 7, Some(row_b), &mut after);
+    book.enter(q(9), 8, Some(row_a), &mut after);
+    // Through an index: behind the latest on each row of its table. The
+    // first on row a is waited for by the second, and so not by name.
+    book.enter(q(4), 7, None, &mut after);
+    assert_eq!(after, [q(2), q(3)]);
+    // Every later one on the table waits for it: one by key, on a row
+    // a query still runs on or on any other, and the next on that row
+    // for that one.
+    assert!(book.taken(7, Some(row_word(&[5]))));
+    book.enter(q(5), 7, Some(row_a), &mut after);
+    assert_eq!(after, [q(4)]);
+    book.enter(q(6), 7, Some(row_a), &mut after);
+    assert_eq!(after, [q(5)]);
+    // The next through an index waits for it, and for those since.
+    book.enter(q(7), 7, None, &mut after);
+    assert_eq!(after, [q(4), q(6)]);
+    // The other table is its own.
+    book.enter(q(10), 8, Some(row_a), &mut after);
+    assert_eq!(after, [q(9)]);
+    // They end in their order; the last through an index is left.
+    let ended = [
+      (1, Some(row_a)),
+      (2, Some(row_a)),
+      (3, Some(row_b)),
+      (4, None),
+      (5, Some(row_a)),
+      (6, Some(row_a)),
+    ];
+    for (n, row) in ended {
+      book.leave(q(n), 7, row);
+      assert!(book.runs_on(7));
+    }
+    // A query by key still waits for it.
+    book.enter(q(8), 7, Some(row_b), &mut after);
+    assert_eq!(after, [q(7)]);
+    book.leave(q(7), 7, None);
+    book.leave(q(8), 7, Some(row_b));
+    assert!(!book.runs_on(7));
+    assert!(book.runs_on(8));
+    assert!(!book.is_empty());
+  }
+
+  #[test]
+  fn a_row_left_gives_its_place_to_the_last_that_came() {
+    let mut book = RunBook::default();
+    let mut after: Vec<QueryId> = Vec::new();
+    let rows = (row_word(&[1]), row_word(&[2]), row_word(&[3]));
+    book.enter(q(1), 7, Some(rows.0), &mut after);
+    book.enter(q(2), 7, Some(rows.1), &mut after);
+    book.enter(q(3), 7, Some(rows.2), &mut after);
+    // The first row is left: the third is found in its place, and the
+    // second where it was.
+    book.leave(q(1), 7, Some(rows.0));
+    assert!(!book.taken(7, Some(rows.0)));
+    book.enter(q(4), 7, Some(rows.2), &mut after);
+    assert_eq!(after, [q(3)]);
+    book.enter(q(5), 7, Some(rows.1), &mut after);
+    assert_eq!(after, [q(2)]);
+    // One that is no longer the latest on its row ends: the row stays.
+    book.leave(q(3), 7, Some(rows.2));
+    assert!(book.taken(7, Some(rows.2)));
+    // The last that came is left: no row moves.
+    book.enter(q(6), 7, Some(rows.0), &mut after);
+    assert!(after.is_empty());
+    book.leave(q(6), 7, Some(rows.0));
+    assert!(!book.taken(7, Some(rows.0)));
+    // One through an index waits for the rows in the order kept, the
+    // same every time.
+    book.enter(q(7), 7, None, &mut after);
+    assert_eq!(after, [q(4), q(5)]);
+    // A row taken over is no longer known: its query ending moves none.
+    book.leave(q(4), 7, Some(rows.2));
+    book.leave(q(5), 7, Some(rows.1));
+    book.enter(q(8), 7, Some(rows.1), &mut after);
+    assert_eq!(after, [q(7)]);
+  }
+
+  #[test]
+  fn what_a_transaction_kept_of_its_queries_serves_the_next() {
+    let mut book = RunBook::default();
+    let mut after: Vec<QueryId> = Vec::new();
+    assert!(!book.has_room());
+    book.enter(q(1), 7, Some(1), &mut after);
+    book.enter(q(2), 7, None, &mut after);
+    assert_eq!(after, [q(1)]);
+    // A committed read waits for the send, which takes the list and
+    // gives it back.
+    book.wait_for_send(q(1));
+    assert!(book.has_undecided());
+    let waiting = book.take_undecided();
+    assert_eq!(waiting, [q(1)]);
+    assert!(!book.has_undecided());
+    book.give_back(waiting);
+    assert!(!book.has_undecided());
+    // Emptied, it is as new, but for its room.
+    book.clear();
+    assert!(book.is_empty() && book.has_room());
+    assert!(!book.taken(7, Some(1)) && !book.taken(7, None));
+    // Another table takes the place of one no query runs on.
+    book.enter(q(3), 9, Some(1), &mut after);
+    assert!(after.is_empty());
+    assert_eq!(book.tables.len(), 1);
+    book.enter(q(4), 7, Some(1), &mut after);
+    assert!(after.is_empty());
+    assert_eq!(book.tables.len(), 2);
+  }
 
   #[test]
   fn a_write_that_fails_once_its_main_row_went_in_rolls_back() {

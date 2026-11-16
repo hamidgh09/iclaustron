@@ -62,6 +62,7 @@ use ic_signals::numbers;
 use ic_util::ptr_array::PtrArray;
 
 use crate::apid_global::ApidShared;
+use crate::blob_run::RunBook;
 use crate::dict_cache;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
@@ -681,6 +682,9 @@ pub struct ApidConnection {
   pub(crate) to_send: Vec<TransId>,
   /// Query lists of transactions closed, emptied, for the next ones.
   pub(crate) spare_lists: Vec<Vec<QueryId>>,
+  /// What transactions closed kept of their BLOB queries, emptied, for
+  /// the next ones.
+  pub(crate) spare_books: Vec<RunBook>,
   /// When what waits in the outgoing buffers began to wait, or zero.
   queued_since: u64,
   /// How long a transaction waits for its replies before it ends with
@@ -852,6 +856,7 @@ impl ApidConnection {
       late_readers: Vec::new(),
       to_send: Vec::new(),
       spare_lists: Vec::new(),
+      spare_books: Vec::new(),
       queued_since: 0,
       reply_wait_nanos,
       next_reply_check: 0,

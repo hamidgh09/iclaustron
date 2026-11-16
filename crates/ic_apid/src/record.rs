@@ -266,6 +266,19 @@ impl Record {
     })
   }
 
+  /// A record of no fields over `table`, which takes no room and costs
+  /// nothing to make or to copy: for an operation whose sections are
+  /// built for it, and which packs and unpacks no row by its record.
+  pub(crate) fn empty(table: &Arc<TableDef>) -> Record {
+    Record {
+      table: Arc::clone(table),
+      fields: Vec::new(),
+      row_size: 0,
+      position_by_id: Vec::new(),
+      has_blob_fields: false,
+    }
+  }
+
   /// A record with every field word-aligned, over the fields named,
   /// or over every field but the blobs if none are named
   /// (`ic_table_def_default_record`): a blob field is in it only when
