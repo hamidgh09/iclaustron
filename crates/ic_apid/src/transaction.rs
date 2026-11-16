@@ -79,6 +79,8 @@
 //! `index.as_table()`, goes to a node holding that partition (chapter
 //! 05 §6.8).
 
+use std::collections::vec_deque;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ic_port::debug::IC_NDB_MESSAGE_LEVEL;
@@ -211,8 +213,8 @@ pub struct Transaction {
   pub(crate) begun: bool,
   /// Queries defined and not yet sent, in order.
   pub(crate) defined: Vec<QueryId>,
-  /// Queries sent and not yet complete.
-  pub(crate) sent: Vec<QueryId>,
+  /// Queries sent and not yet complete, in the order they were sent.
+  pub(crate) sent: SentList,
   ops_sent: u32,
   ops_completed: u32,
   /// The application asked to commit, or to roll back, and the request
@@ -344,9 +346,15 @@ impl Transaction {
   /// A query that waited its turn behind a BLOB query on its row goes
   /// now: off the lists, and last among the defined, where its request,
   /// the last staged, belongs, since a batch's flags go by this order.
-  pub(crate) fn define_last(&mut self, qid: QueryId) {
-    self.sent.retain(|other| *other != qid);
-    self.defined.retain(|other| *other != qid);
+  /// `sent_no` is its number among those sent, if a send has taken it:
+  /// it is then on that list, and else among the defined.
+  pub(crate) fn define_last(&mut self, qid: QueryId, sent_no: Option<u32>) {
+    match sent_no {
+      Some(no) => {
+        self.sent.remove(no, qid);
+      }
+      None => self.defined.retain(|other| *other != qid),
+    }
     self.defined.push(qid);
   }
 
@@ -377,6 +385,124 @@ impl Transaction {
   /// still running, if that is later; zero if neither has happened.
   pub(crate) fn wait_started(&self) -> u64 {
     self.last_sent.max(self.heard_at)
+  }
+}
+
+/// No query: what a place of a [`SentList`] holds once its query has
+/// left. A query's id is never this.
+const NO_QUERY: QueryId = QueryId(PtrId::NONE);
+
+/// A transaction's queries sent and not yet complete, in the order they
+/// were sent, kept so that a query leaves in the same few steps however
+/// many are out (chapter 06, 12.11).
+///
+/// Each query sent takes the next place and the next number, which it
+/// keeps (`Execution::sent_no`) and leaves by, with no search for it.
+/// A place left stays, empty, until every place before it is empty
+/// too, when the list's start moves past them. So the list reaches
+/// from the oldest query still out to the last one sent, the order of
+/// those on it is the order they were sent in, and each place is
+/// passed once as it is taken and once as it goes.
+#[derive(Default)]
+pub(crate) struct SentList {
+  /// The number of the query in the first place.
+  first_no: u32,
+  /// A place for each query sent since the oldest still out.
+  places: VecDeque<QueryId>,
+  /// How many queries are on the list.
+  count: u32,
+}
+
+impl SentList {
+  /// An empty list in the room of `spare`, a list that a transaction
+  /// closed left.
+  pub(crate) fn with_room(mut spare: Vec<QueryId>) -> SentList {
+    spare.clear();
+    SentList {
+      first_no: 0,
+      places: VecDeque::from(spare),
+      count: 0,
+    }
+  }
+
+  /// Its room, emptied, for another transaction's list.
+  pub(crate) fn into_room(mut self) -> Vec<QueryId> {
+    self.places.clear();
+    Vec::from(self.places)
+  }
+
+  /// True if no query is on it.
+  pub(crate) fn is_empty(&self) -> bool {
+    self.count == 0
+  }
+
+  /// The number the next query sent gets. A query leaving does not
+  /// change it.
+  pub(crate) fn next_no(&self) -> u32 {
+    self.first_no.wrapping_add(self.places.len() as u32)
+  }
+
+  /// Queries sent, in their order: the first gets the number
+  /// [`next_no`](Self::next_no) gave before, each of the others the
+  /// one after.
+  pub(crate) fn add_all(&mut self, qids: &[QueryId]) {
+    self.places.extend(qids);
+    self.count += qids.len() as u32;
+  }
+
+  /// The query sent with the number `no` leaves. False if it is not on
+  /// the list by that number: nothing is done then.
+  pub(crate) fn remove(&mut self, no: u32, qid: QueryId) -> bool {
+    let at = no.wrapping_sub(self.first_no) as usize;
+    match self.places.get_mut(at) {
+      Some(place) if *place == qid && qid != NO_QUERY => *place = NO_QUERY,
+      _ => return false,
+    }
+    self.count -= 1;
+    // The start moves past the places left empty at it.
+    while self.places.front() == Some(&NO_QUERY) {
+      self.places.pop_front();
+      self.first_no = self.first_no.wrapping_add(1);
+    }
+    true
+  }
+
+  /// The queries on it, in the order they were sent.
+  pub(crate) fn to_vec(&self) -> Vec<QueryId> {
+    let mut all: Vec<QueryId> = Vec::with_capacity(self.count as usize);
+    for qid in self {
+      all.push(*qid);
+    }
+    all
+  }
+}
+
+/// The queries on a [`SentList`], in the order they were sent.
+pub(crate) struct SentIter<'a> {
+  places: vec_deque::Iter<'a, QueryId>,
+}
+
+impl<'a> Iterator for SentIter<'a> {
+  type Item = &'a QueryId;
+
+  fn next(&mut self) -> Option<&'a QueryId> {
+    loop {
+      let qid = self.places.next()?;
+      if *qid != NO_QUERY {
+        return Some(qid);
+      }
+    }
+  }
+}
+
+impl<'a> IntoIterator for &'a SentList {
+  type Item = &'a QueryId;
+  type IntoIter = SentIter<'a>;
+
+  fn into_iter(self) -> SentIter<'a> {
+    SentIter {
+      places: self.places.iter(),
+    }
   }
 }
 
@@ -668,7 +794,7 @@ impl ApidConnection {
       state: CommitState::Started,
       begun: false,
       defined: self.spare_lists.pop().unwrap_or_default(),
-      sent: self.spare_lists.pop().unwrap_or_default(),
+      sent: SentList::with_room(self.spare_lists.pop().unwrap_or_default()),
       ops_sent: 0,
       ops_completed: 0,
       end_wanted: None,
@@ -739,9 +865,9 @@ impl ApidConnection {
     if let Some(mut trans) = self.transactions.remove(id.0) {
       if self.spare_lists.len() < IC_SPARE_QUERY_LISTS {
         trans.defined.clear();
-        trans.sent.clear();
         self.spare_lists.push(std::mem::take(&mut trans.defined));
-        self.spare_lists.push(std::mem::take(&mut trans.sent));
+        let sent = std::mem::take(&mut trans.sent);
+        self.spare_lists.push(sent.into_room());
       }
       if trans.blob.has_room() && self.spare_books.len() < IC_SPARE_RUN_BOOKS {
         trans.blob.clear();
@@ -1080,6 +1206,7 @@ impl ApidConnection {
           takeover: takeover.map(|over| over.of),
           part_of: None,
           shell: false,
+          sent_no: None,
         },
         user_ref,
         callback,
@@ -1343,7 +1470,7 @@ impl ApidConnection {
   /// waits while a BLOB query of the transaction plans a further round:
   /// it goes on that query's last round.
   fn send_transaction(&mut self, id: TransId) -> Result<(), IcError> {
-    let (defined, end_wanted, begun, coord, trans_id, held) =
+    let (defined, end_wanted, begun, coord, trans_id, held, first_no) =
       match self.transactions.get_mut(id.0) {
         Some(trans) if trans.ended() => return Ok(()),
         Some(trans) => (
@@ -1353,6 +1480,7 @@ impl ApidConnection {
           trans.coord,
           trans.trans_id,
           trans.blob_planning > 0,
+          trans.sent.next_no(),
         ),
         None => return Ok(()),
       };
@@ -1378,9 +1506,11 @@ impl ApidConnection {
     let mut start = !begun;
     for (i, qid) in defined.iter().enumerate() {
       let last = Some(i) == last_packed;
-      // Each query is looked up once, as it goes.
+      // Each query is looked up once, as it goes, and told the number
+      // it gets on the list of those sent, which it joins below.
+      let sent_no = first_no.wrapping_add(i as u32);
       if let Some(committed_read) =
-        self.send_query(*qid, start, last, last && commit_now)
+        self.send_query(*qid, sent_no, start, last, last && commit_now)
       {
         start = false;
         if !committed_read {
@@ -1396,7 +1526,7 @@ impl ApidConnection {
     let end = match self.transactions.get_mut(id.0) {
       Some(trans) => {
         trans.begun = begun;
-        trans.sent.extend_from_slice(&defined);
+        trans.sent.add_all(&defined);
         trans.ops_sent += defined.len() as u32;
         if commit_now && last_packed.is_some() {
           trans.state = CommitState::CommitRequested;
@@ -1515,7 +1645,8 @@ impl ApidConnection {
   }
 
   /// One query of a batch goes, the query looked up once: it is sent
-  /// from here on, and its request, packed when it was defined, is
+  /// from here on, with `sent_no` its number among its transaction's
+  /// queries sent, and its request, packed when it was defined, is
   /// given its place in the batch. `None` for a query with nothing
   /// packed, a BLOB query or one that waits its turn behind one, which
   /// goes on no wire; else whether the request is a committed read,
@@ -1523,12 +1654,14 @@ impl ApidConnection {
   fn send_query(
     &mut self,
     qid: QueryId,
+    sent_no: u32,
     start: bool,
     execute: bool,
     commit: bool,
   ) -> Option<bool> {
     let query = self.queries.get_mut(qid.0)?;
     query.set_state(QueryState::Sent);
+    query.execution.sent_no = Some(sent_no);
     let staged = std::mem::take(&mut query.execution.staged);
     if staged.len == 0 {
       return None;
@@ -1966,7 +2099,7 @@ impl ApidConnection {
       None => return false,
     };
     let (coord, sent) = match self.transactions.get(tid.0) {
-      Some(trans) => (trans.coord, trans.sent.clone()),
+      Some(trans) => (trans.coord, trans.sent.to_vec()),
       None => return false,
     };
     let lost_read = IcError::new(IC_NDB_ERROR_TAKEOVER_READ_LOST);
@@ -2142,7 +2275,7 @@ impl ApidConnection {
   /// inside it does nothing. A BLOB query's part operation goes to its
   /// query instead, and is idle again; a BLOB query's run ends with it.
   pub(crate) fn finish_query(&mut self, qid: QueryId) {
-    let (tid, callback, user_ref, takeover, part_of, error) =
+    let (tid, callback, user_ref, takeover, part_of, error, sent_no) =
       match self.queries.get_mut(qid.0) {
         Some(query) => (
           query.execution.trans,
@@ -2151,8 +2284,9 @@ impl ApidConnection {
           query.execution.takeover.take(),
           query.execution.part_of,
           query.error(),
+          query.execution.sent_no.take(),
         ),
-        None => (None, None, 0, None, None, None),
+        None => (None, None, 0, None, None, None, None),
       };
     if let Some(of) = part_of {
       let mut error_data: u32 = 0;
@@ -2160,7 +2294,7 @@ impl ApidConnection {
         error_data = query.error_data();
       }
       if let Some(tid) = tid {
-        self.leave_transaction(qid, tid);
+        self.leave_transaction(qid, tid, sent_no);
       }
       if let Some(query) = self.queries.get_mut(qid.0) {
         query.set_state(QueryState::Idle);
@@ -2173,7 +2307,7 @@ impl ApidConnection {
       self.executed.push_back(qid);
     }
     if let Some(tid) = tid {
-      self.leave_transaction(qid, tid);
+      self.leave_transaction(qid, tid, sent_no);
     }
     // A takeover is done, confirmed or failed: its receiver may go on
     // once the batch's others are (chapter 05 §7.2).
@@ -2195,23 +2329,32 @@ impl ApidConnection {
 
   /// The query off its transaction's lists, the transaction closed out
   /// if that was its last, and a commit that waited for it sent.
-  fn leave_transaction(&mut self, qid: QueryId, tid: TransId) {
+  /// `sent_no` is the query's number among those sent, if a send took
+  /// it: it leaves that list by it, in the same few steps however many
+  /// are out (chapter 06, 12.11). One that no send took, failed before
+  /// it went, is looked for among the defined.
+  fn leave_transaction(
+    &mut self,
+    qid: QueryId,
+    tid: TransId,
+    sent_no: Option<u32>,
+  ) {
     if let Some(trans) = self.transactions.get_mut(tid.0) {
-      let mut i: usize = 0;
-      while i < trans.sent.len() {
-        if trans.sent[i] == qid {
-          trans.sent.remove(i);
-          trans.ops_completed += 1;
-        } else {
-          i += 1;
+      match sent_no {
+        Some(no) => {
+          if trans.sent.remove(no, qid) {
+            trans.ops_completed += 1;
+          }
         }
-      }
-      i = 0;
-      while i < trans.defined.len() {
-        if trans.defined[i] == qid {
-          trans.defined.remove(i);
-        } else {
-          i += 1;
+        None => {
+          let mut i: usize = 0;
+          while i < trans.defined.len() {
+            if trans.defined[i] == qid {
+              trans.defined.remove(i);
+            } else {
+              i += 1;
+            }
+          }
         }
       }
     }
@@ -2241,7 +2384,7 @@ impl ApidConnection {
         let mut sent: Vec<QueryId> = Vec::new();
         if ended == CommitState::RolledBack {
           defined = trans.defined.clone();
-          sent = trans.sent.clone();
+          sent = trans.sent.to_vec();
         }
         (sent, trans.error_data)
       }
@@ -2440,7 +2583,7 @@ impl ApidConnection {
     let error = IcError::new(IC_NDB_ERROR_NO_REPLY);
     for tid in expired {
       let (coord, ended, sent) = match self.transactions.get(tid.0) {
-        Some(trans) => (trans.coord, trans.ended(), trans.sent.clone()),
+        Some(trans) => (trans.coord, trans.ended(), trans.sent.to_vec()),
         // A callback has already closed it.
         None => continue,
       };
@@ -2741,7 +2884,7 @@ mod tests {
       state: CommitState::Started,
       begun: true,
       defined: Vec::new(),
-      sent: vec![QueryId(PtrId::from_u64(1))],
+      sent: SentList::default(),
       ops_sent: 1,
       ops_completed: 0,
       end_wanted: None,
@@ -2754,10 +2897,12 @@ mod tests {
       blob_planning: 0,
       blob: RunBook::default(),
     };
+    let one = QueryId(PtrId::from_u64(1));
+    trans.sent.add_all(&[one]);
     assert!(!trans.is_done());
     trans.state = CommitState::Committed;
     assert!(!trans.is_done());
-    trans.sent.clear();
+    assert!(trans.sent.remove(0, one));
     assert!(trans.is_done());
   }
 
@@ -2770,7 +2915,7 @@ mod tests {
       state: CommitState::Started,
       begun: true,
       defined: Vec::new(),
-      sent: Vec::new(),
+      sent: SentList::default(),
       ops_sent: 1,
       ops_completed: 1,
       end_wanted: None,
@@ -2793,13 +2938,14 @@ mod tests {
     // Open with every reply in: the application's turn, however long.
     assert!(!trans.waited_too_long(AT + 10 * LIMIT, LIMIT));
     // A query sent and not complete.
-    trans.sent.push(QueryId(PtrId::from_u64(1)));
+    let one = QueryId(PtrId::from_u64(1));
+    trans.sent.add_all(&[one]);
     assert!(!trans.waited_too_long(AT + LIMIT - 1, LIMIT));
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
     // A clock that reads earlier than the send is not a wait.
     assert!(!trans.waited_too_long(AT - 1, LIMIT));
     // A commit asked of the coordinator, every query complete.
-    trans.sent.clear();
+    assert!(trans.sent.remove(0, one));
     trans.state = CommitState::CommitRequested;
     assert!(!trans.waited_too_long(AT + LIMIT - 1, LIMIT));
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
@@ -2809,7 +2955,7 @@ mod tests {
     trans.state = CommitState::Committed;
     assert!(!trans.waited_too_long(AT + 10 * LIMIT, LIMIT));
     // Ended, with a read's row still to come.
-    trans.sent.push(QueryId(PtrId::from_u64(2)));
+    trans.sent.add_all(&[QueryId(PtrId::from_u64(2))]);
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
     // Never sent: nothing to wait for.
     let mut idle = sent_at(0);
@@ -2822,7 +2968,7 @@ mod tests {
     const LIMIT: u64 = 1_000;
     const AT: u64 = 50_000;
     let mut trans = sent_at(AT);
-    trans.sent.push(QueryId(PtrId::from_u64(1)));
+    trans.sent.add_all(&[QueryId(PtrId::from_u64(1))]);
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
     assert_eq!(trans.wait_started(), AT);
     // Heard from just before the wait ran out: it runs from there, and
@@ -2880,18 +3026,101 @@ mod tests {
     let two = QueryId(PtrId::from_u64(2));
     let three = QueryId(PtrId::from_u64(3));
     let mut trans = sent_at(1);
-    trans.sent = vec![one, two];
+    trans.sent.add_all(&[one, two]);
     trans.defined = vec![three];
-    // It went with a send, as a query that is on no wire yet: its
-    // request, staged now, goes behind what is defined.
-    trans.define_last(one);
-    assert!(trans.sent == [two]);
+    // It went with a send, as a query that is on no wire yet, the
+    // first of the two sent: its request, staged now, goes behind what
+    // is defined.
+    trans.define_last(one, Some(0));
+    assert_eq!(trans.sent.to_vec(), [two]);
     assert!(trans.defined == [three, one]);
     // One that no send has taken yet moves last too, since requests
     // staged after it was defined go before its own.
-    trans.define_last(three);
-    assert!(trans.sent == [two]);
+    trans.define_last(three, None);
+    assert_eq!(trans.sent.to_vec(), [two]);
     assert!(trans.defined == [one, three]);
+  }
+
+  #[test]
+  fn a_query_leaves_the_sent_list_by_its_number() {
+    let mut ids: Vec<QueryId> = Vec::new();
+    for n in 1..=6 {
+      ids.push(QueryId(PtrId::from_u64(n)));
+    }
+    let mut sent = SentList::default();
+    assert!(sent.is_empty());
+    assert_eq!(sent.next_no(), 0);
+    sent.add_all(&ids[0..4]);
+    assert_eq!(sent.next_no(), 4);
+    assert_eq!(sent.to_vec(), ids[0..4]);
+    // One from the middle: the others keep their order and numbers.
+    assert!(sent.remove(1, ids[1]));
+    assert_eq!(sent.to_vec(), [ids[0], ids[2], ids[3]]);
+    assert_eq!(sent.next_no(), 4);
+    // Not twice, not by another's number, and not one never on it.
+    assert!(!sent.remove(1, ids[1]));
+    assert!(!sent.remove(2, ids[3]));
+    assert!(!sent.remove(4, ids[4]));
+    assert!(!sent.remove(1, NO_QUERY));
+    assert_eq!(sent.to_vec(), [ids[0], ids[2], ids[3]]);
+    // The oldest goes: the start moves past it and the place left
+    // empty behind it, and the next sent still gets the next number.
+    assert!(sent.remove(0, ids[0]));
+    assert_eq!(sent.places.len(), 2);
+    assert_eq!(sent.next_no(), 4);
+    sent.add_all(&ids[4..6]);
+    assert_eq!(sent.to_vec(), ids[2..6]);
+    // A number from before the start names no one.
+    assert!(!sent.remove(0, ids[0]));
+    // The last sent goes first: its place waits for those before it.
+    assert!(sent.remove(5, ids[5]));
+    assert!(sent.remove(3, ids[3]));
+    assert_eq!(sent.places.len(), 4);
+    assert_eq!(sent.to_vec(), [ids[2], ids[4]]);
+    // The start stops at the oldest still out, the fifth, with the
+    // empty place of the sixth behind it.
+    assert!(sent.remove(2, ids[2]));
+    assert_eq!(sent.places.len(), 2);
+    assert!(sent.remove(4, ids[4]));
+    assert!(sent.is_empty());
+    assert!(sent.places.is_empty());
+    assert_eq!(sent.next_no(), 6);
+  }
+
+  #[test]
+  fn the_sent_list_numbers_on_past_the_last_number() {
+    let one = QueryId(PtrId::from_u64(1));
+    let two = QueryId(PtrId::from_u64(2));
+    let three = QueryId(PtrId::from_u64(3));
+    let mut sent = SentList {
+      first_no: u32::MAX,
+      ..SentList::default()
+    };
+    sent.add_all(&[one, two, three]);
+    assert_eq!(sent.next_no(), 2);
+    assert!(sent.remove(0, two));
+    assert!(sent.remove(u32::MAX, one));
+    assert_eq!(sent.to_vec(), [three]);
+    assert!(sent.remove(1, three));
+    assert!(sent.is_empty());
+    assert_eq!(sent.next_no(), 2);
+  }
+
+  #[test]
+  fn the_room_of_a_sent_list_serves_the_next() {
+    let one = QueryId(PtrId::from_u64(1));
+    let mut sent = SentList::with_room(Vec::with_capacity(64));
+    sent.add_all(&[one]);
+    assert!(sent.remove(0, one));
+    let room = sent.into_room();
+    assert!(room.is_empty());
+    assert!(room.capacity() >= 64);
+    // A list left with a query on it is emptied as its room is taken.
+    let mut sent = SentList::with_room(room);
+    sent.add_all(&[one]);
+    let room = sent.into_room();
+    assert!(room.is_empty());
+    assert!(room.capacity() >= 64);
   }
 
   #[test]

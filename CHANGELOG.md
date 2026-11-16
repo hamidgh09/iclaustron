@@ -3,6 +3,87 @@
 What each release of iClaustron brought. How a release is made:
 [`doc/releasing.md`](doc/releasing.md).
 
+## After 1.1.0, on `trunk` (not released)
+
+What `trunk` holds beyond 1.1.0, to become the next release's section
+when it is cut. Fixes from a review of everything between 1.0.0 and
+1.1.0, and what the client spends on its own bookkeeping
+(`doc/rust/06-phases.md`, 12.10 and 12.11). 1.1.0 itself takes no
+changes.
+
+### What it needs
+
+As 1.1.0: a RonDB cluster whose data nodes are of version 26.10.0 or
+later.
+
+### Fixed
+
+- A blob value with more part data than `blob_round_bytes`, read in a
+  transaction left open, had its later parts read with the row's lock
+  let go: a writer between the rounds could give a torn value or a
+  false 4267. The lock is now let go once the last part is back.
+- A write or an update of a blob value that failed after its main
+  row's write had gone in could still commit, leaving the row with the
+  new head and none of its parts. It now rolls its transaction back.
+- A query with no blob value could overtake a blob query on its row
+  within one transaction, so that a row deleted and then written again
+  ended up deleted. Queries on one row now go in the order they were
+  defined, and one through a unique index waits for every blob query
+  on its table, not only the latest.
+- A blob read that succeeded reported a result length of 0, which
+  stands for a row that was not there. It is now the bytes of the main
+  row, and 0 only for a read that failed.
+- A completed blob read could not be freed while its unlock was still
+  out: `free_query` gave `IC_ERROR_TRANSACTION_ACTIVE`.
+- A stored length that is wrong no longer makes a read ask for that
+  much memory before a part has come: the buffer grows as the parts
+  come, and the read fails with 4267.
+- The synchronous helpers gave up, with `IC_ERROR_TIMEOUT`, on a
+  transaction its coordinator had just said was still running. They
+  now wait by the transaction's own clock.
+- `ic_apid_query_blob_buffer`, `ic_blob_values_buffer` and
+  `ic_request_blob_buffer` took any length, and one no memory holds
+  stopped the program. A length past what the column's type holds is
+  refused with 4266, and one there is no room for with
+  `IC_ERROR_MEM_ALLOC`.
+- `ic_bench`, `ic_trans` and `ic_read` refused a table with a blob
+  column that cannot be used. They leave such a column out, and say
+  which.
+- Three texts, the header's on `IC_ERROR_DELETE_WITH_BLOBS`,
+  `write_key`'s and 4266's, and one row of the user guide's table of
+  codes, still described 1.0's handling of blob columns.
+
+### Faster
+
+Nothing here changes what goes on the wire, and no rate was measured.
+
+- A query that completes leaves its transaction in the same few steps
+  however many are out. Before, and since 1.0, each one was looked for
+  through every query the transaction had out: for a batch of 500,
+  some 125 000 compares.
+- A transaction's blob queries find whom to wait for by row, where
+  each looked at every other one running.
+- A blob query's own operations no longer build a record of every
+  column of their table, and a send looks each query up once.
+
+### New
+
+- `IC_ERROR_MEM_ALLOC` (7005), in the C header and in Rust.
+- In Rust, `blob_buf_sized` on a query, on a request's operation and
+  on `BlobValues`: a blob buffer of a given length, refused rather
+  than made when it is too long or there is no room.
+  `TableDef::usable_field_ids` gives the fields a record may name, and
+  `ApidConnection::queries_open` how many queries a connection holds.
+
+### Changed: programs built against 1.1.0
+
+- A blob read in a transaction left open sends one request more, the
+  unlock, after its last part. A read that commits is as it was.
+- A blob read's result length is the main row's bytes, where it was 0.
+- In C, a blob buffer longer than its column's type holds is refused
+  when it is asked for, where it was refused when the query was
+  defined.
+
 ## 1.1.0 (2026-11-13)
 
 Blob columns, read and written whole by key. Nothing of 1.0.0 is

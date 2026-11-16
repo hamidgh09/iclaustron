@@ -255,6 +255,10 @@ pub(crate) struct Execution {
   /// A BLOB query itself, which goes on no wire: its run's operations
   /// carry it.
   pub shell: bool,
+  /// Its number on its transaction's list of queries sent, while it is
+  /// on it: it leaves the list by it, with no search for it
+  /// (`SentList`).
+  pub sent_no: Option<u32>,
 }
 
 /// The BLOB query an operation of the driver's is for, the round it

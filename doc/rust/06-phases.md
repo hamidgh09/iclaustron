@@ -3245,7 +3245,43 @@ saves looks, not requests.
 One thing seen and left: `leave_transaction` walks its transaction's
 whole list of sent queries for each one that completes, in every
 transaction and since 1.0, so that a batch of 500 costs some 125 000
-compares. It is not of this review's range.
+compares. It is not of this review's range, and was done after it
+(12.11).
+
+### 12.11 A query leaves its transaction in one step (2026-11-16)
+
+What the review saw and left (12.10). Each query that completed was
+looked for through its transaction's whole list of queries sent, taken
+out by moving every later one up a place, and then looked for through
+the list of those defined: for a batch of 500 some 125 000 compares
+and as many moves, in every transaction and since 1.0. A callback that
+defines the next query as each one completes, the usual way to keep a
+connection busy, made the second list grow as the batch came in, and
+the walk of it with it.
+
+The list of queries sent is now a `SentList` (`transaction.rs`). Each
+query sent gets the next number and the place it names, and keeps the
+number (`Execution::sent_no`): it leaves by it, with no search. A
+place left stays, empty, until those before it are empty too, when the
+list's start moves past them, so that a place is passed once as it is
+taken and once as it goes. The order on the list is still the order of
+sending, in which a rollback, a failed coordinator and the reply
+timeout fail the queries still out. A query that a send has taken is
+on that list and not among the defined, so those are searched only for
+one that failed before it went. A list's room still goes from one
+transaction to the next.
+
+The list reaches from the oldest query still out to the last one sent:
+a query out for long while others come and go keeps their places,
+eight bytes each, until it is back. What walks the list passes the
+empty places too. `ops_out` does so for each completion while a commit
+asked for alone waits and a BLOB query is at the list's start; that
+case is left as it is.
+
+Tests: unit tests of `SentList`, for a query leaving from the middle,
+the start and the end, numbers that name no one, numbering on past the
+last number, and the room kept; every integration test completes its
+queries through it. No rate was measured.
 
 ### Not in this phase
 

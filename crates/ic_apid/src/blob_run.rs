@@ -2156,13 +2156,15 @@ impl ApidConnection {
     self.put_run(qid, run, values);
     match staged {
       Ok(staged) => {
+        let mut sent_no: Option<u32> = None;
         if let Some(query) = self.queries.get_mut(qid.0) {
           query.execution.staged = staged;
           query.execution.shell = false;
           query.set_state(QueryState::Defined);
+          sent_no = query.execution.sent_no.take();
         }
         if let Some(trans) = self.transactions.get_mut(tid.0) {
-          trans.define_last(qid);
+          trans.define_last(qid, sent_no);
         }
         self.end_blob_run(qid);
         self.queue_for_send(tid);
