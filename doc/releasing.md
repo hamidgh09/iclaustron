@@ -17,8 +17,9 @@ aarch64, macOS on aarch64.
   `trunk` when the release is cut, and is tagged on it: `v1.0.0`.
 - A released branch takes no further changes (the author, 2026-11-12),
   fixes included: they go to `trunk`, and reach users in the next
-  release, which gets a branch of its own, `1.1.0`, made from `trunk`
-  once its work is ready to release.
+  release, which gets a branch of its own made from `trunk` once its
+  work is ready to release, as `1.1.0` did, and `1.1.1` for the fixes
+  to it.
 
 ## Version numbers
 
@@ -44,7 +45,9 @@ What a number means, for the C API and for the Rust crates alike:
 - **Minor**: something added (functions, values appended at the end, a
   field at the end of a structure whose size is passed in); a program
   built against the one before runs unchanged.
-- **Patch**: fixes only.
+- **Patch**: fixes, and no more added than a fix brings with it, as
+  an error code it gives; a program built against the one before runs
+  unchanged.
 
 ## Before the tag: the checks
 
@@ -97,13 +100,13 @@ Run on the commit to be tagged, on the release branch.
 
 ## Cutting the release
 
-1. For a new major or minor version, make its branch from `trunk`:
+1. Make the release's branch from `trunk`, whatever its number: a
+   patch release gets one too, since the branch of the release it
+   fixes takes no changes.
 
    ```sh
    git switch -c 1.1.0 trunk
    ```
-
-   A patch release is made on the existing branch.
 
 2. Set the version: `version` in `Cargo.toml`, then the three
    `IC_API_VERSION_*` in `crates/ic_capi/src/lib.rs` to match. Build
@@ -119,16 +122,20 @@ Run on the commit to be tagged, on the release branch.
    README's status line and the user guide's dependency lines (section
    1, the tag) up to date.
 
-4. Commit, and cherry-pick the commit to `trunk`.
+4. Commit, and bring `trunk` to the same commit: the release is part
+   of `trunk`'s history. (Made on `trunk` before the branch is, the
+   commit is on both from the start.)
 
 5. Run the checks above on the release branch.
 
 6. Tag the release on its branch, annotated, with its CHANGELOG section
    as the message (first line `iClaustron <version>`), and push the
-   branches and the tag:
+   branches and the tag. The cleanup mode keeps the section's
+   headings, which git would else take for comments and drop, as it
+   did from the message of `v1.1.0`:
 
    ```sh
-   git tag -a v1.1.0 -F notes.txt
+   git tag -a v1.1.0 --cleanup=whitespace -F notes.txt
    git push origin 1.1.0 trunk v1.1.0
    ```
 

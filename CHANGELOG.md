@@ -3,13 +3,14 @@
 What each release of iClaustron brought. How a release is made:
 [`doc/releasing.md`](doc/releasing.md).
 
-## After 1.1.0, on `trunk` (not released)
+## 1.1.1 (2026-11-16)
 
-What `trunk` holds beyond 1.1.0, to become the next release's section
-when it is cut. Fixes from a review of everything between 1.0.0 and
-1.1.0, and what the client spends on its own bookkeeping
-(`doc/rust/06-phases.md`, 12.10 and 12.11). 1.1.0 itself takes no
-changes.
+Fixes to 1.1.0, from a review of everything between 1.0.0 and 1.1.0,
+and less spent by the client on its own bookkeeping
+(`doc/rust/06-phases.md`, 12.10 and 12.11). Nothing of 1.1.0 is
+removed: a program built against it runs unchanged but in the three
+cases below. One error code and five Rust functions came with the
+fixes.
 
 ### What it needs
 

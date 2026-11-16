@@ -179,7 +179,7 @@
 /*
  Patch version of the C API.
  */
-#define IC_API_VERSION_PATCH 0
+#define IC_API_VERSION_PATCH 1
 
 /*
  A shared lock taken and let go of in the read.

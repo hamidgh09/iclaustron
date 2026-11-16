@@ -37,11 +37,11 @@ From Rust, depend on the crates by path or git, at a release's tag:
 
 ```toml
 [dependencies]
-ic_apid = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.1.0" }
-ic_port = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.1.0" }
+ic_apid = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.1.1" }
+ic_port = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.1.1" }
 ```
 
-Each release has a branch of its own (`1.1.0`), which takes no further
+Each release has a branch of its own (`1.1.1`), which takes no further
 changes once released; development goes on in `trunk`, and fixes reach
 programs in the next release.
 

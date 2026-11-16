@@ -2347,7 +2347,9 @@ from `trunk` as 1.1.0, blob support for key operations (the author,
 2026-11-11). `1.0.0` is released and takes no further changes, fixes
 included; the branch `1.1.0` is made from `trunk` once blob handling is
 ready to release (the author, 2026-11-12). It was made, and 1.1.0
-released from it, on 2026-11-13.
+released from it, on 2026-11-13. What the review of it found (12.10)
+and what followed (12.11) is released as 1.1.1, from a branch of its
+own made from `trunk` (the author, 2026-11-16).
 
 ### How each operation goes
 
@@ -3095,7 +3097,7 @@ A review of everything between 1.0.0 and 1.1.0, each finding checked
 against the code. Fifteen held, and all are fixed on `trunk`
 (2026-11-14), in three steps: the first four, the next seven, and the
 last four, which change what the client spends and nothing it does;
-1.1.0 itself takes no changes.
+1.1.0 itself takes no changes. They are released in 1.1.1.
 
 1. **The unlock went with the first round of parts**, not after the
    last: in a transaction left open, a value with more part data than
@@ -3325,6 +3327,10 @@ trees").
 **Release 1.1.0** (the author, 2026-11-13) is cut after phase 12, on
 its branch `1.1.0` made from `trunk`: blob columns by key, nothing
 removed or changed from 1.0.0.
+
+**Release 1.1.1** (the author, 2026-11-16) is cut on its branch
+`1.1.1` made from `trunk`: the fifteen fixes of the review of 1.1.0
+(12.10) and a query leaving its transaction in one step (12.11).
 
 **Data nodes of RonDB 26.02** (looked at 2026-11-05). Release 1.0
 needs data nodes of 26.10.0 or later; the author asked whether the bar

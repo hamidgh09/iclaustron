@@ -91,7 +91,7 @@ pub const IC_API_VERSION_MAJOR: u32 = 1;
 /// Minor version of the C API.
 pub const IC_API_VERSION_MINOR: u32 = 1;
 /// Patch version of the C API.
-pub const IC_API_VERSION_PATCH: u32 = 0;
+pub const IC_API_VERSION_PATCH: u32 = 1;
 
 // ---- Values (the C header's #defines) ----
 

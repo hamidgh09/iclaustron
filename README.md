@@ -4,7 +4,7 @@ A client library for RonDB 26.10 data nodes (an API node speaking the
 NDB protocol) written in C-like Rust, MIT licensed, usable from Rust, C,
 C++ and any language that can call C.
 
-Status: release 1.1.0, on branch `1.1.0`; development goes on in
+Status: release 1.1.1, on branch `1.1.1`; development goes on in
 `trunk`, and a released branch takes no further changes. It needs data
 nodes of RonDB 26.10.0 or later. What each release brought is in
 [`CHANGELOG.md`](CHANGELOG.md), and how one is made in
