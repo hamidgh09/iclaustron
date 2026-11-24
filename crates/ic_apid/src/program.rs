@@ -68,6 +68,7 @@ use ic_port::err;
 use ic_port::IcError;
 use ic_signals::column_header;
 use ic_signals::interp;
+use ic_signals::interp::BitOp;
 use ic_signals::interp::ColumnCmp;
 use ic_signals::interp::Label;
 use ic_signals::interp::NullRule;
@@ -86,7 +87,7 @@ pub const IC_PROGRAM_INPUTS: u32 = interp::IC_INTERP_INPUTS;
 
 /// The longest program, in words: the data node takes a column section
 /// of fewer than 32 768 words in all.
-const IC_MAX_PROGRAM_WORDS: usize = 32_000;
+pub(crate) const IC_MAX_PROGRAM_WORDS: usize = 32_000;
 /// The most terms a condition may come to once flattened.
 const IC_MAX_TERMS: usize = 16_384;
 /// How deep values may nest in values, and ANDs in ORs.
@@ -147,7 +148,7 @@ impl Cmp {
     }
   }
 
-  fn reg_cmp(self) -> RegCmp {
+  pub(crate) fn reg_cmp(self) -> RegCmp {
     match self {
       Cmp::Eq => RegCmp::Eq,
       Cmp::Ne => RegCmp::Ne,
@@ -209,6 +210,8 @@ enum ValueNode {
   Input(u32),
   Add(Value, Value),
   Subtract(Value, Value),
+  Bits(BitOp, Value, Value),
+  BitNot(Value),
 }
 
 #[derive(Debug)]
@@ -336,6 +339,48 @@ impl ProgramBuilder {
     self.check_value(a);
     self.check_value(b);
     self.push_value(ValueNode::Subtract(a, b))
+  }
+
+  /// `a AND b`, bit by bit, NULL if either is. The bitwise values are
+  /// of integers of 64 bits, as the sums are.
+  pub fn bit_and(&mut self, a: Value, b: Value) -> Value {
+    self.push_bits(BitOp::And, a, b)
+  }
+
+  /// `a OR b`, bit by bit, NULL if either is.
+  pub fn bit_or(&mut self, a: Value, b: Value) -> Value {
+    self.push_bits(BitOp::Or, a, b)
+  }
+
+  /// `a XOR b`, bit by bit, NULL if either is.
+  pub fn bit_xor(&mut self, a: Value, b: Value) -> Value {
+    self.push_bits(BitOp::Xor, a, b)
+  }
+
+  /// `a` with every bit inverted, NULL if it is.
+  pub fn bit_not(&mut self, a: Value) -> Value {
+    self.check_value(a);
+    self.push_value(ValueNode::BitNot(a))
+  }
+
+  /// `a` shifted left by `count` bits, NULL if either is. The count is
+  /// 0 to 63: an integer beyond fails the finish, and a value beyond
+  /// fails the operation (891).
+  pub fn shift_left(&mut self, a: Value, count: Value) -> Value {
+    self.push_bits(BitOp::ShiftLeft, a, count)
+  }
+
+  /// `a` shifted right by `count` bits, 0 to 63, NULL if either is. A
+  /// signed value keeps its sign; one of an unsigned column is filled
+  /// with zeros.
+  pub fn shift_right(&mut self, a: Value, count: Value) -> Value {
+    self.push_bits(BitOp::ShiftRight, a, count)
+  }
+
+  fn push_bits(&mut self, op: BitOp, a: Value, b: Value) -> Value {
+    self.check_value(a);
+    self.check_value(b);
+    self.push_value(ValueNode::Bits(op, a, b))
   }
 
   /// `a` compared with `b`; unknown if either is NULL.
@@ -602,7 +647,34 @@ pub struct Program {
   uses_disk: bool,
 }
 
+/// What an [`InstructionBuilder`](crate::instructions::InstructionBuilder)
+/// hands over of the program it wrote.
+pub(crate) struct ProgramParts {
+  pub(crate) table: Arc<TableDef>,
+  pub(crate) code: Vec<u32>,
+  pub(crate) refusals: Vec<u32>,
+  pub(crate) inputs: u32,
+  pub(crate) writes: bool,
+  pub(crate) own_codes: bool,
+  pub(crate) uses_disk: bool,
+}
+
 impl Program {
+  /// A program written an instruction at a time, with no updates after
+  /// it.
+  pub(crate) fn from_parts(parts: ProgramParts) -> Program {
+    Program {
+      table: parts.table,
+      code: parts.code,
+      refusals: parts.refusals,
+      updates: Vec::new(),
+      inputs: parts.inputs,
+      writes: parts.writes,
+      own_codes: parts.own_codes,
+      uses_disk: parts.uses_disk,
+    }
+  }
+
   /// The table it is for.
   pub fn table(&self) -> &Arc<TableDef> {
     &self.table
@@ -1103,9 +1175,12 @@ impl<'a> Compiler<'a> {
       ValueNode::Column(column) => Ok(self.attr(*column)?.nullable),
       ValueNode::Constant { bytes, .. } => Ok(bytes.is_none()),
       ValueNode::Integer(_) | ValueNode::Input(_) => Ok(false),
-      ValueNode::Add(x, y) | ValueNode::Subtract(x, y) => Ok(
+      ValueNode::Add(x, y)
+      | ValueNode::Subtract(x, y)
+      | ValueNode::Bits(_, x, y) => Ok(
         self.may_be_null(*x, depth + 1)? || self.may_be_null(*y, depth + 1)?,
       ),
+      ValueNode::BitNot(x) => self.may_be_null(*x, depth + 1),
     }
   }
 
@@ -1147,7 +1222,40 @@ impl<'a> Compiler<'a> {
       }
       ValueNode::Add(x, y) => self.arith(true, *x, *y, reg, depth),
       ValueNode::Subtract(x, y) => self.arith(false, *x, *y, reg, depth),
+      ValueNode::Bits(op, x, y) => self.bits(*op, *x, *y, reg, depth),
+      ValueNode::BitNot(x) => {
+        let null = self.eval(*x, reg, depth + 1)?;
+        self.w.bit_not(reg, reg);
+        Ok(null)
+      }
     }
+  }
+
+  /// `x op y` into `reg`; an integer that fits the field stands in the
+  /// instruction itself.
+  fn bits(
+    &mut self,
+    op: BitOp,
+    x: Value,
+    y: Value,
+    reg: u32,
+    depth: u32,
+  ) -> Result<bool, IcError> {
+    if let ValueNode::Integer(k) = self.b.values[y.0 as usize] {
+      // A shift by an integer that is no count of bits never works.
+      if op.is_shift() && !(0..=i64::from(interp::IC_MAX_SHIFT)).contains(&k) {
+        return Err(IcError::new(err::IC_ERROR_BAD_PROGRAM));
+      }
+      if (0..=0xFFFF).contains(&k) {
+        let null = self.eval(x, reg, depth + 1)?;
+        self.w.bits_imm(op, reg, reg, k as u16);
+        return Ok(null);
+      }
+    }
+    let x_null = self.eval(x, reg, depth + 1)?;
+    let y_null = self.eval(y, reg + 1, depth + 1)?;
+    self.w.bits(op, reg, reg, reg + 1);
+    Ok(x_null || y_null)
   }
 
   /// `x + y` or `x − y` into `reg`; an integer that fits the field is
@@ -1286,13 +1394,13 @@ impl<'a> Compiler<'a> {
   }
 }
 
-fn is_integer(attr: &ColumnProps) -> bool {
+pub(crate) fn is_integer(attr: &ColumnProps) -> bool {
   (table_props::IC_TYPE_TINYINT..=table_props::IC_TYPE_BIGUNSIGNED)
     .contains(&attr.type_code)
 }
 
 /// The integer columns a register is written to: 32 and 64 bits.
-fn is_wide_integer(attr: &ColumnProps) -> bool {
+pub(crate) fn is_wide_integer(attr: &ColumnProps) -> bool {
   matches!(
     attr.type_code,
     table_props::IC_TYPE_INT
@@ -1340,6 +1448,24 @@ fn integer_of(attr: &ColumnProps, bytes: &[u8]) -> Result<i64, IcError> {
 #[cfg(test)]
 pub(crate) fn test_table() -> Arc<TableDef> {
   tests::table()
+}
+
+/// The tests' table with column `disk` kept on disk.
+#[cfg(test)]
+pub(crate) fn test_table_with_disk(disk: u32) -> Arc<TableDef> {
+  tests::table_with_disk(Some(disk))
+}
+
+/// As [`run_model`], saying the code a program refuses with, `None`
+/// where it accepts; a program that runs more than 16 000 instructions
+/// is an error, "886".
+#[cfg(test)]
+pub(crate) fn run_model_code(
+  words: &[u32],
+  row: &[Option<i64>],
+  inputs: &[i64; 16],
+) -> Result<(Option<u32>, tests::Writes), String> {
+  tests::run_code(words, row, inputs)
 }
 
 /// Run a program's code on the tests' model of the interpreter over a
@@ -1443,7 +1569,7 @@ mod tests {
 
   /// The tests' table with column `disk`, if one is named, kept on
   /// disk.
-  fn table_with_disk(disk: Option<u32>) -> Arc<TableDef> {
+  pub(super) fn table_with_disk(disk: Option<u32>) -> Arc<TableDef> {
     let mut w = PropertyWriter::new();
     w.add_string(IC_TP_TABLE_NAME, "db/def/interp_t");
     w.add_u32(IC_TP_COLUMN_COUNT, COLUMNS.len() as u32);
@@ -1900,6 +2026,103 @@ mod tests {
   }
 
   #[test]
+  fn bitwise_values_are_worked_out_in_registers() {
+    // (val AND 12) = 8: val into register 0, the integer in the
+    // instruction, 8 into register 1.
+    let mut f = Fixture::new();
+    let c = f.b.column(VAL);
+    let mask = f.b.integer(12);
+    let masked = f.b.bit_and(c, mask);
+    let eight = f.b.integer(8);
+    let top = f.b.compare(Cmp::Eq, masked, eight);
+    let p = f.b.finish(Some(top)).expect("finish");
+    assert_eq!(
+      p.words(),
+      [
+        0x0001_0001, // r0 = val
+        0x000C_8020, // r0 = r0 AND 12, instruction 96
+        0x0008_0044, // r1 = 8
+        0x0003_000A, // if r0 is NULL, to the refusal
+        0x0002_020D, // if r0 <> r1, to the refusal
+        0x12,
+        0x0272_0013,
+      ]
+    );
+    let inputs = [0i64; 16];
+    let row =
+      |val: Option<i64>| [Some(1), val, None, None, None, Some(0), None];
+    assert_eq!(
+      run(p.words(), &row(Some(10)), &inputs).map(|r| r.0),
+      Ok(true)
+    );
+    assert_eq!(
+      run(p.words(), &row(Some(6)), &inputs).map(|r| r.0),
+      Ok(false)
+    );
+    assert_eq!(run(p.words(), &row(None), &inputs).map(|r| r.0), Ok(false));
+  }
+
+  #[test]
+  fn each_bitwise_value_is_assigned_as_sql_has_it() {
+    // w = the value of val and n; NULL where val is.
+    type Make = fn(&mut ProgramBuilder, Value, Value) -> Value;
+    let assign = |make: Make, val: Option<i64>, n: i64| {
+      let mut f = Fixture::new();
+      let x = f.b.column(VAL);
+      let y = f.b.column(N);
+      let v = make(&mut f.b, x, y);
+      f.b.assign(W, v);
+      let p = f.b.finish(None).expect("finish");
+      let row = [Some(1), val, None, None, None, Some(n), None];
+      run(p.words(), &row, &[0i64; 16]).map(|(_, w)| w[0].1)
+    };
+    let val = Some(0b1100);
+    assert_eq!(assign(|b, x, y| b.bit_and(x, y), val, 0b1010), Ok(Some(8)));
+    assert_eq!(assign(|b, x, y| b.bit_or(x, y), val, 0b1010), Ok(Some(14)));
+    assert_eq!(assign(|b, x, y| b.bit_xor(x, y), val, 0b1010), Ok(Some(6)));
+    assert_eq!(assign(|b, x, _| b.bit_not(x), val, 0), Ok(Some(!12)));
+    assert_eq!(assign(|b, x, y| b.shift_left(x, y), val, 3), Ok(Some(96)));
+    assert_eq!(assign(|b, x, y| b.shift_right(x, y), val, 2), Ok(Some(3)));
+    assert_eq!(
+      assign(|b, x, y| b.shift_right(x, y), Some(-12), 2),
+      Ok(Some(-3))
+    );
+    assert_eq!(assign(|b, x, y| b.bit_and(x, y), None, 1), Ok(None));
+    assert_eq!(assign(|b, x, _| b.bit_not(x), None, 1), Ok(None));
+    // Nested, with integers: ((val XOR 5) << 2) OR 1, and a mask too
+    // wide for the instruction's field, which goes by a register.
+    let nested: Make = |b, x, _| {
+      let five = b.integer(5);
+      let two = b.integer(2);
+      let one = b.integer(1);
+      let mixed = b.bit_xor(x, five);
+      let shifted = b.shift_left(mixed, two);
+      b.bit_or(shifted, one)
+    };
+    assert_eq!(assign(nested, val, 0), Ok(Some(((12 ^ 5) << 2) | 1)));
+    let wide: Make = |b, x, _| {
+      let mask = b.integer(0x1_0000);
+      b.bit_or(x, mask)
+    };
+    assert_eq!(assign(wide, val, 0), Ok(Some(0x1_000C)));
+    // A count of bits the row gives that is none fails the operation;
+    // an integer that is none fails the finish.
+    assert_eq!(
+      assign(|b, x, y| b.shift_left(x, y), val, 64),
+      Err("891".to_string())
+    );
+    for count in [-1i64, 64] {
+      let mut f = Fixture::new();
+      let x = f.b.column(VAL);
+      let k = f.b.integer(count);
+      let v = f.b.shift_right(x, k);
+      f.b.assign(W, v);
+      let e = f.b.finish(None).expect_err("count");
+      assert_eq!(e.code, err::IC_ERROR_BAD_PROGRAM, "count {}", count);
+    }
+  }
+
+  #[test]
   fn a_program_too_long_for_its_checks_is_called_too_long() {
     // A check is three words and its refusal one; with the acceptance
     // 7 999 checks are 31 997 words, 8 000 are 32 001.
@@ -2063,13 +2286,29 @@ mod tests {
     row: &[Option<i64>],
     inputs: &[i64; 16],
   ) -> Result<(bool, Writes), String> {
+    let (refused, writes) = run_code(words, row, inputs)?;
+    Ok((refused.is_none(), writes))
+  }
+
+  /// As [`run`], saying the code a program refuses with, `None` where
+  /// it accepts. A program that runs more than 16 000 instructions is
+  /// ended as the data node ends it, with 886; the model counts each as
+  /// one, where the data node counts a column test for more.
+  pub(super) fn run_code(
+    words: &[u32],
+    row: &[Option<i64>],
+    inputs: &[i64; 16],
+  ) -> Result<(Option<u32>, Writes), String> {
     let mut regs: [Option<i64>; 8] = [None; 8];
     let mut writes: Writes = Vec::new();
     let mut pc: usize = 0;
     let mut steps: u32 = 0;
     loop {
       steps += 1;
-      if steps > 100_000 || pc >= words.len() {
+      if steps > 16_000 {
+        return Err("886".to_string());
+      }
+      if pc >= words.len() {
         return Err(format!("ran off at {}", pc));
       }
       let w = words[pc];
@@ -2080,6 +2319,12 @@ mod tests {
       let r4 = ((w >> 16) & 7) as usize;
       let field = w >> 16;
       let distance = ((w >> 16) & 0x7FFF) as usize;
+      // Bit 31 makes a jump's distance one backwards.
+      let target = if w >> 31 == 1 {
+        pc.wrapping_sub(distance)
+      } else {
+        pc + distance
+      };
       match insn {
         1 => {
           regs[r1] = row[field as usize];
@@ -2123,10 +2368,10 @@ mod tests {
           };
           pc += 1;
         }
-        9 => pc += distance,
+        9 => pc = target,
         10 | 11 => {
           if regs[r1].is_none() == (insn == 10) {
-            pc += distance;
+            pc = target;
           } else {
             pc += 1;
           }
@@ -2137,13 +2382,13 @@ mod tests {
             _ => return Err("878".to_string()),
           };
           if holds(insn - 12, a, b) {
-            pc += distance;
+            pc = target;
           } else {
             pc += 1;
           }
         }
-        18 => return Ok((true, writes)),
-        19 => return Ok((false, Vec::new())),
+        18 => return Ok((None, writes)),
+        19 => return Ok((Some(field), Vec::new())),
         23 | 27 => {
           let w2 = words[pc + 1];
           let column = row[(w2 >> 16) as usize];
@@ -2160,13 +2405,13 @@ mod tests {
           match (value, column) {
             (Some(v), Some(c)) => {
               if holds(cmp, v, c) {
-                pc += distance;
+                pc = target;
               } else {
                 pc += len;
               }
             }
             _ => match (w >> 6) & 3 {
-              2 => pc += distance,
+              2 => pc = target,
               3 => pc += len,
               rule => return Err(format!("NULL rule {}", rule)),
             },
@@ -2175,10 +2420,26 @@ mod tests {
         24 | 25 => {
           let column = row[(words[pc + 1] >> 16) as usize];
           if column.is_none() == (insn == 24) {
-            pc += distance;
+            pc = target;
           } else {
             pc += 2;
           }
+        }
+        28 | 29 | 32..=34 | 92 | 93 | 96..=98 => {
+          let second = if insn >= 64 {
+            Some(field as i64)
+          } else {
+            regs[r2]
+          };
+          regs[r3] = match (regs[r1], second) {
+            (Some(a), Some(b)) => Some(bit_op(insn & 63, a, b)?),
+            _ => None,
+          };
+          pc += 1;
+        }
+        36 => {
+          regs[r3] = regs[r1].map(|a| !a);
+          pc += 1;
         }
         121 => {
           regs[r1] = Some(inputs[field as usize]);
@@ -2187,6 +2448,22 @@ mod tests {
         _ => return Err(format!("instruction {}", insn)),
       }
     }
+  }
+
+  /// Bitwise instruction `insn` of `a` and `b`, both signed: a shift
+  /// right keeps the sign, and a shift by more than 63 bits is the
+  /// data node's error.
+  fn bit_op(insn: u32, a: i64, b: i64) -> Result<i64, String> {
+    if (insn == 28 || insn == 29) && !(0..=63).contains(&b) {
+      return Err("891".to_string());
+    }
+    Ok(match insn {
+      28 => ((a as u64) << b) as i64,
+      29 => a >> b,
+      32 => a & b,
+      33 => a | b,
+      _ => a ^ b,
+    })
   }
 
   /// Comparison `cmp`, 0 to 5, of `a` with `b`.
@@ -2225,6 +2502,12 @@ mod tests {
       ValueNode::Subtract(x, y) => {
         Some(value_of(b, *x, row, inputs)? - value_of(b, *y, row, inputs)?)
       }
+      ValueNode::Bits(op, x, y) => {
+        let x = value_of(b, *x, row, inputs)?;
+        let y = value_of(b, *y, row, inputs)?;
+        Some(bit_op(*op as u32, x, y).expect("a count of bits"))
+      }
+      ValueNode::BitNot(x) => Some(!value_of(b, *x, row, inputs)?),
     }
   }
 

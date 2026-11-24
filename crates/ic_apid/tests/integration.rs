@@ -98,6 +98,7 @@ use ic_apid::executor::OpShape;
 use ic_apid::executor::Request;
 use ic_apid::executor::Submitter;
 use ic_apid::index_scan::ScanRange;
+use ic_apid::instructions::InstructionBuilder;
 use ic_apid::key_op;
 use ic_apid::program::Cmp;
 use ic_apid::program::Cond;
@@ -12658,6 +12659,573 @@ fn refuse_through_an_executor_each_operation_says_its_check() {
   let balance =
     count_of(&format!("SELECT balance FROM {}.ref_api WHERE id = 1", db));
   assert_eq!(balance, 50, "row 1's update rolled back with it");
+}
+
+// ---- Instructions: programs with loops (phase 11.6) ----
+
+/// The code [`loop_times`] refuses a negative count with.
+const IC_IT_LOOP_NEGATIVE: i32 = 6001;
+/// What the data node ends a program with that runs too long.
+const IC_IT_LOOP_TOO_LONG: i32 = 886;
+
+/// Make and fill the `loop_api` table: row 1 is 7 six times, row 2 has
+/// a NULL val, row 3 a negative n, row 5 is 3 four times; with
+/// `runaway`, row 4 turns a hundred thousand times.
+fn fill_loop(runaway: bool) -> Option<()> {
+  let more = if runaway {
+    ", (4, 1, 100000, NULL)"
+  } else {
+    ""
+  };
+  mysql(&format!(
+    "CREATE DATABASE IF NOT EXISTS {db};
+     DROP TABLE IF EXISTS {db}.loop_api;
+     CREATE TABLE {db}.loop_api (
+       id INT NOT NULL PRIMARY KEY,
+       val INT, n INT NOT NULL, w INT
+     ) ENGINE=NDB;
+     INSERT INTO {db}.loop_api VALUES
+       (1, 7, 6, NULL), (2, NULL, 6, NULL), (3, 7, -1, NULL),
+       (5, 3, 4, NULL){more};",
+    db = IC_IT_DB,
+    more = more
+  ))?;
+  Some(())
+}
+
+/// r2 = val × the count, by adding val the count's times: the count is
+/// n, or input 0 with `from_input`. A NULL val is refused as a missed
+/// condition is, a negative count with 6001. Then, with `writes`,
+/// w = r2 and the row passes; without, it passes if r2 >= input 1.
+fn loop_times(
+  def: &Arc<TableDef>,
+  from_input: bool,
+  writes: bool,
+) -> Arc<Program> {
+  let val = def.field_id("val").expect("val");
+  let n = def.field_id("n").expect("n");
+  let w = def.field_id("w").expect("w");
+  let mut b = InstructionBuilder::new(def);
+  let again = b.label();
+  let done = b.label();
+  let no_value = b.label();
+  let negative = b.label();
+  b.read_column(0, val);
+  b.jump_if_null(0, no_value);
+  if from_input {
+    b.read_input(1, 0);
+  } else {
+    b.read_column(1, n);
+  }
+  b.set_integer(2, 0);
+  b.set_integer(3, 0);
+  b.jump_if(Cmp::Lt, 1, 3, negative);
+  b.place(again);
+  b.jump_if(Cmp::Ge, 3, 1, done);
+  b.add(2, 2, 0);
+  b.add_integer(3, 3, 1);
+  b.jump(again);
+  b.place(done);
+  if writes {
+    b.write_column(w, 2);
+  } else {
+    b.read_input(4, 1);
+    b.jump_if(Cmp::Lt, 2, 4, no_value);
+  }
+  b.accept();
+  b.place(no_value);
+  b.refuse();
+  b.place(negative);
+  if writes {
+    b.refuse_with(IC_IT_LOOP_NEGATIVE as u32);
+  } else {
+    // A scan takes no code of the application's own.
+    b.refuse();
+  }
+  b.finish().expect("the program")
+}
+
+/// Update row `id` of `loop_api` with the program on `guarded`, as a
+/// transaction of its own: how it ended, and the query's and the
+/// transaction's errors.
+fn loop_update(
+  conn: &mut ApidConnection,
+  t: &Table,
+  key_rec: &Record,
+  guarded: QueryId,
+  id: i64,
+  option: AbortOption,
+) -> (CommitState, Option<IcError>, Option<IcError>) {
+  let query = conn.query_mut(guarded).expect("the query");
+  text_row::put_value(key_rec, 0, &id.to_string(), query.key_row_mut())
+    .expect("id");
+  let tid = conn
+    .start_transaction(TransactionHint::Any, Some(&t.def))
+    .expect("a transaction");
+  let write = WriteKeyArgs {
+    kind: WriteKind::Update,
+    abort_option: option,
+    ..WriteKeyArgs::default()
+  };
+  conn
+    .write_key(guarded, tid, &write)
+    .expect("the guarded update");
+  conn.commit_transaction(tid).expect("commit");
+  let state = finish(conn, tid);
+  let query_error = conn.query(guarded).expect("the query").error();
+  let trans_error = conn.transaction(tid).expect("the transaction").error();
+  conn.close_transaction(tid).expect("close");
+  (state, query_error, trans_error)
+}
+
+/// True if either error is `code`.
+fn loop_said(
+  code: i32,
+  query_error: Option<IcError>,
+  trans_error: Option<IcError>,
+) -> bool {
+  [query_error, trans_error]
+    .into_iter()
+    .flatten()
+    .any(|e| e.code == code)
+}
+
+#[test]
+fn loop_an_update_multiplies_by_adding_in_the_data_node() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if fill_loop(true).is_none() {
+    return;
+  }
+  let db = IC_IT_DB;
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "loop_api");
+  let id_column = t.def.field_id("id").expect("id");
+  let key_rec = Record::default_for(&t.def, Some(&[id_column])).expect("key");
+  let program = loop_times(&t.def, false, true);
+  assert!(program.writes());
+  assert!(program.own_codes());
+  let guarded = conn
+    .create_query(&t.def, &key_rec, &key_rec)
+    .expect("a query");
+  conn
+    .query_mut(guarded)
+    .expect("the query")
+    .set_program(Some(&program))
+    .expect("the program");
+  let w_of = |id: i64| {
+    mysql(&format!(
+      "SELECT IFNULL(w, -1) FROM {}.loop_api WHERE id = {}",
+      db, id
+    ))
+    .expect("w")
+    .trim()
+    .parse::<i64>()
+    .expect("a number")
+  };
+
+  for (option, aborts) in [
+    (AbortOption::Default, true),
+    (AbortOption::IgnoreError, false),
+  ] {
+    // Row 2, a NULL val: the plain refusal, 6000 or 626 by the option.
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, 2, option);
+    let what = format!("aborts {}: {:?} {:?}", aborts, qe, te);
+    if aborts {
+      assert_eq!(state, CommitState::RolledBack, "{}", what);
+      assert!(loop_said(6000, qe, te), "{}", what);
+    } else {
+      assert_eq!(state, CommitState::Committed, "{}", what);
+      assert_eq!(
+        qe.map(|e| e.code),
+        Some(key_op::IC_NDB_ERROR_NO_SUCH_ROW as i32),
+        "{}",
+        what
+      );
+    }
+    // Row 3, a negative count: the code of the program's own, either
+    // way.
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, 3, option);
+    let what = format!("aborts {}: {:?} {:?}", aborts, qe, te);
+    assert!(loop_said(IC_IT_LOOP_NEGATIVE, qe, te), "{}", what);
+    assert!(!loop_said(6000, qe, te), "{}", what);
+    if aborts {
+      assert_eq!(state, CommitState::RolledBack, "{}", what);
+    } else {
+      assert_eq!(state, CommitState::Committed, "{}", what);
+    }
+    // Row 4 turns a hundred thousand times: the data node ends the
+    // program, and the operation fails with 886.
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, 4, option);
+    let what = format!("aborts {}: {:?} {:?}", aborts, qe, te);
+    assert!(loop_said(IC_IT_LOOP_TOO_LONG, qe, te), "{}", what);
+    if aborts {
+      assert_eq!(state, CommitState::RolledBack, "{}", what);
+    } else {
+      // The operation fails alone, as with any error it ignores.
+      assert_eq!(state, CommitState::Committed, "{}", what);
+      assert_eq!(qe.map(|e| e.code), Some(IC_IT_LOOP_TOO_LONG), "{}", what);
+    }
+  }
+  assert_eq!(w_of(2), -1);
+  assert_eq!(w_of(3), -1);
+  assert_eq!(w_of(4), -1);
+
+  // Rows 1 and 5 pass: 7 six times, 3 four times, after the program
+  // that ran too long as before it.
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  assert!(qe.is_none(), "{:?}", qe);
+  assert_eq!(w_of(1), 42);
+  let (state, qe, te) = loop_update(
+    &mut conn,
+    &t,
+    &key_rec,
+    guarded,
+    5,
+    AbortOption::IgnoreError,
+  );
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  assert!(qe.is_none(), "{:?}", qe);
+  assert_eq!(w_of(5), 12);
+
+  // The count from input 0: one program, a count for each operation.
+  let counted = loop_times(&t.def, true, true);
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&counted)).expect("the program");
+  for (turns, product) in [(0i64, 0i64), (1, 7), (1000, 7000)] {
+    let query = conn.query_mut(guarded).expect("the query");
+    query.set_input(0, turns).expect("the count");
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+    assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+    assert_eq!(w_of(1), product, "{} turns", turns);
+  }
+  // 3000 turns are run, 5000 are more than the data node runs on a
+  // row: seen on RonDB 26.10.1, 3996 turns passed and 3997 did not.
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_input(0, 3000).expect("the count");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  assert_eq!(w_of(1), 21000);
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_input(0, 5000).expect("the count");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::RolledBack, "{:?} {:?}", qe, te);
+  assert!(loop_said(IC_IT_LOOP_TOO_LONG, qe, te), "{:?} {:?}", qe, te);
+  assert_eq!(w_of(1), 21000);
+}
+
+#[test]
+fn loop_a_scan_filters_by_a_loop_and_ends_on_one_too_long() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if fill_loop(false).is_none() {
+    return;
+  }
+  let db = IC_IT_DB;
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "loop_api");
+  let filter = loop_times(&t.def, false, false);
+  assert!(!filter.writes());
+  assert!(!filter.own_codes());
+  let scan = conn.create_scan(&t.def, &t.rec).expect("a scan");
+  conn
+    .set_scan_program(scan, Some(&filter))
+    .expect("the filter");
+  let args = ScanArgs::default();
+
+  // val × n is 42 for row 1 and 12 for row 5; rows 2 and 3 are
+  // refused before the loop.
+  for (least, expect) in [(12i64, vec![1i64, 5]), (13, vec![1]), (43, vec![])] {
+    conn.set_scan_input(scan, 1, least).expect("the least");
+    let (mut ids, _, error) = scan_ids(&mut conn, &t, scan, &args);
+    ids.sort_unstable();
+    assert!(error.is_none(), "{:?}", error);
+    assert_eq!(ids, expect, "at least {}", least);
+  }
+
+  // A row whose loop runs too long ends the scan with 886.
+  mysql(&format!(
+    "INSERT INTO {}.loop_api VALUES (4, 1, 100000, NULL)",
+    db
+  ))
+  .expect("the runaway row");
+  conn.set_scan_input(scan, 1, 12).expect("the least");
+  let (_, _, error) = scan_ids(&mut conn, &t, scan, &args);
+  assert_eq!(
+    error.map(|e| e.code),
+    Some(IC_IT_LOOP_TOO_LONG),
+    "the scan ends with the program's error"
+  );
+  conn.free_scan(scan).expect("free the scan");
+}
+
+// ---- Bitwise values and instructions (phase 11.7) ----
+
+/// What the data node says of a shift by more than 63 bits.
+const IC_IT_BITS_SHIFT: i32 = 891;
+
+/// Make and fill the `bits_api` table: (id, val, n, w, big).
+fn fill_bits() -> Option<()> {
+  mysql(&format!(
+    "CREATE DATABASE IF NOT EXISTS {db};
+     DROP TABLE IF EXISTS {db}.bits_api;
+     CREATE TABLE {db}.bits_api (
+       id INT NOT NULL PRIMARY KEY,
+       val INT, n INT NOT NULL, w BIGINT, big BIGINT UNSIGNED
+     ) ENGINE=NDB;
+     INSERT INTO {db}.bits_api VALUES
+       (1, 12, 10, 0, 0xF000000000000000), (2, -12, 2, 0, 1),
+       (3, NULL, 1, 0, NULL), (4, 182, 64, 0, 5);",
+    db = IC_IT_DB
+  ))?;
+  Some(())
+}
+
+/// Row `id`'s w, `None` for NULL.
+fn bits_w(id: i64) -> Option<i64> {
+  let text = mysql(&format!(
+    "SELECT IFNULL(w, 'NULL') FROM {}.bits_api WHERE id = {}",
+    IC_IT_DB, id
+  ))
+  .expect("w");
+  match text.trim() {
+    "NULL" => None,
+    number => Some(number.parse().expect("a number")),
+  }
+}
+
+#[test]
+fn bits_values_of_a_program_are_what_the_data_node_makes_of_them() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if fill_bits().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bits_api");
+  let id_column = t.def.field_id("id").expect("id");
+  let val = t.def.field_id("val").expect("val");
+  let n = t.def.field_id("n").expect("n");
+  let w = t.def.field_id("w").expect("w");
+  let big = t.def.field_id("big").expect("big");
+  let key_rec = Record::default_for(&t.def, Some(&[id_column])).expect("key");
+  let guarded = conn
+    .create_query(&t.def, &key_rec, &key_rec)
+    .expect("a query");
+
+  // w = val with n, for each: rows 1 and 2 are (12, 10) and (-12, 2),
+  // and row 3 has a NULL val, which makes w NULL.
+  type Make = fn(&mut ProgramBuilder, Value, Value) -> Value;
+  type Expect = fn(i64, i64) -> i64;
+  let cases: [(&str, Make, Expect); 7] = [
+    ("and", |b, x, y| b.bit_and(x, y), |x, y| x & y),
+    ("or", |b, x, y| b.bit_or(x, y), |x, y| x | y),
+    ("xor", |b, x, y| b.bit_xor(x, y), |x, y| x ^ y),
+    ("not", |b, x, _| b.bit_not(x), |x, _| !x),
+    ("shift left", |b, x, y| b.shift_left(x, y), |x, y| x << y),
+    // A signed value keeps its sign.
+    ("shift right", |b, x, y| b.shift_right(x, y), |x, y| x >> y),
+    // With integers, which stand in the instructions themselves.
+    (
+      "integers",
+      |b, x, _| {
+        let five = b.integer(5);
+        let two = b.integer(2);
+        let one = b.integer(1);
+        let mask = b.integer(0xFFF);
+        let mixed = b.bit_xor(x, five);
+        let shifted = b.shift_left(mixed, two);
+        let set = b.bit_or(shifted, one);
+        b.bit_and(set, mask)
+      },
+      |x, _| (((x ^ 5) << 2) | 1) & 0xFFF,
+    ),
+  ];
+  for (name, make, expect) in cases {
+    let mut b = ProgramBuilder::new(&t.def);
+    let x = b.column(val);
+    let y = b.column(n);
+    let value = make(&mut b, x, y);
+    b.assign(w, value);
+    let program = b.finish(None).expect("the program");
+    let query = conn.query_mut(guarded).expect("the query");
+    query.set_program(Some(&program)).expect("the program");
+    for (id, x, y) in [(1i64, 12i64, 10i64), (2, -12, 2)] {
+      let (state, qe, te) =
+        loop_update(&mut conn, &t, &key_rec, guarded, id, AbortOption::Default);
+      assert_eq!(state, CommitState::Committed, "{}: {:?} {:?}", name, qe, te);
+      assert_eq!(
+        bits_w(id),
+        Some(expect(x, y)),
+        "{} of {} and {}",
+        name,
+        x,
+        y
+      );
+    }
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, 3, AbortOption::Default);
+    assert_eq!(state, CommitState::Committed, "{}: {:?} {:?}", name, qe, te);
+    assert_eq!(bits_w(3), None, "{} of NULL", name);
+    mysql(&format!(
+      "UPDATE {}.bits_api SET w = 0 WHERE id = 3",
+      IC_IT_DB
+    ))
+    .expect("w back");
+  }
+
+  // A value of an unsigned column is unsigned: shifted right it fills
+  // with zeros, where a signed one would keep its sign.
+  let mut b = ProgramBuilder::new(&t.def);
+  let x = b.column(big);
+  let sixty = b.integer(60);
+  let top = b.shift_right(x, sixty);
+  b.assign(w, top);
+  let program = b.finish(None).expect("the program");
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&program)).expect("the program");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  assert_eq!(bits_w(1), Some(15));
+
+  // Row 4's n is 64, which is no count of bits: the operation fails.
+  let mut b = ProgramBuilder::new(&t.def);
+  let x = b.column(val);
+  let y = b.column(n);
+  let value = b.shift_left(x, y);
+  b.assign(w, value);
+  let program = b.finish(None).expect("the program");
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&program)).expect("the program");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 4, AbortOption::Default);
+  assert_eq!(state, CommitState::RolledBack, "{:?} {:?}", qe, te);
+  assert!(loop_said(IC_IT_BITS_SHIFT, qe, te), "{:?} {:?}", qe, te);
+  assert_eq!(bits_w(4), Some(0));
+
+  // A scan's filter: the rows whose val has every bit of input 0.
+  let mut b = ProgramBuilder::new(&t.def);
+  let x = b.column(val);
+  let mask = b.input(0);
+  let masked = b.bit_and(x, mask);
+  let top = b.compare(Cmp::Eq, masked, mask);
+  let filter = b.finish(Some(top)).expect("the filter");
+  let scan = conn.create_scan(&t.def, &t.rec).expect("a scan");
+  conn
+    .set_scan_program(scan, Some(&filter))
+    .expect("the filter");
+  for (mask, expect) in [(4i64, vec![1i64, 2, 4]), (8, vec![1]), (1, vec![])] {
+    conn.set_scan_input(scan, 0, mask).expect("the mask");
+    let (mut ids, _, error) =
+      scan_ids(&mut conn, &t, scan, &ScanArgs::default());
+    ids.sort_unstable();
+    assert!(error.is_none(), "{:?}", error);
+    assert_eq!(ids, expect, "mask {}", mask);
+  }
+  conn.free_scan(scan).expect("free the scan");
+}
+
+#[test]
+fn bits_a_loop_counts_the_bits_set() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if fill_bits().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bits_api");
+  let id_column = t.def.field_id("id").expect("id");
+  let val = t.def.field_id("val").expect("val");
+  let n = t.def.field_id("n").expect("n");
+  let w = t.def.field_id("w").expect("w");
+  let key_rec = Record::default_for(&t.def, Some(&[id_column])).expect("key");
+
+  // w = the bits set in val: the lowest added, val shifted right by
+  // one, until nothing is left. A NULL val and a negative one are
+  // refused.
+  let mut b = InstructionBuilder::new(&t.def);
+  let again = b.label();
+  let done = b.label();
+  let no = b.label();
+  b.read_column(0, val);
+  b.jump_if_null(0, no);
+  b.set_integer(1, 0);
+  b.set_integer(2, 0);
+  b.jump_if(Cmp::Lt, 0, 1, no);
+  b.place(again);
+  b.jump_if(Cmp::Eq, 0, 1, done);
+  b.bit_and_integer(3, 0, 1);
+  b.add(2, 2, 3);
+  b.shift_right_integer(0, 0, 1);
+  b.jump(again);
+  b.place(done);
+  b.write_column(w, 2);
+  b.accept();
+  b.place(no);
+  b.refuse();
+  let program = b.finish().expect("the program");
+  let guarded = conn
+    .create_query(&t.def, &key_rec, &key_rec)
+    .expect("a query");
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&program)).expect("the program");
+  for (id, bits) in [(1i64, 2i64), (4, 5)] {
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, id, AbortOption::Default);
+    assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+    assert_eq!(bits_w(id), Some(bits), "row {}", id);
+  }
+  for id in [2i64, 3] {
+    let (state, qe, te) =
+      loop_update(&mut conn, &t, &key_rec, guarded, id, AbortOption::Default);
+    assert_eq!(state, CommitState::RolledBack, "{:?} {:?}", qe, te);
+    assert!(loop_said(6000, qe, te), "row {}: {:?} {:?}", id, qe, te);
+  }
+
+  // Every instruction on registers: w = ((val AND n) OR (val XOR n))
+  // shifted left by 2, right by 1, and inverted. For row 1, 12 and 10.
+  let mut b = InstructionBuilder::new(&t.def);
+  b.read_column(0, val);
+  b.read_column(1, n);
+  b.bit_and(2, 0, 1);
+  b.bit_xor(3, 0, 1);
+  b.bit_or(2, 2, 3);
+  b.set_integer(4, 2);
+  b.shift_left(2, 2, 4);
+  b.set_integer(4, 1);
+  b.shift_right(2, 2, 4);
+  b.bit_or_integer(2, 2, 0x100);
+  b.bit_xor_integer(2, 2, 0x101);
+  b.shift_left_integer(2, 2, 3);
+  b.bit_not(2, 2);
+  b.write_column(w, 2);
+  b.accept();
+  let program = b.finish().expect("the program");
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&program)).expect("the program");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  let both: i64 = (12 & 10) | (12 ^ 10);
+  let moved: i64 = (both << 2) >> 1;
+  assert_eq!(bits_w(1), Some(!(((moved | 0x100) ^ 0x101) << 3)));
 }
 
 // ---- AUTO_INCREMENT (phase 9.2a) ----

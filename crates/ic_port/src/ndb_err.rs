@@ -530,7 +530,12 @@ const IC_NDB_ERRORS: &[ErrorEntry] = &[
   ErrorEntry {
     code: 886,
     class: ErrorClass::Application,
-    text: "The program ran more than 8000 instructions on a row",
+    text: "The program ran too long on a row and was ended",
+  },
+  ErrorEntry {
+    code: 891,
+    class: ErrorClass::Application,
+    text: "The program shifted by a count of bits that is not 0 to 63",
   },
   ErrorEntry {
     code: 882,

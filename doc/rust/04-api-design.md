@@ -1228,7 +1228,93 @@ between them, without subroutine ids for the caller to keep:
   (chapter 05 §9.4). The error table classes 6001 to 6999 as raised by
   the application's program, permanent, with one text for all.
 
+- **Bitwise values (phase 11.7, 2026-11-24)**: `bit_and(a, b)`,
+  `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`, `shift_left(a, count)`
+  and `shift_right(a, count)` on the builder, values as `add` and
+  `subtract` are and worked out in registers the same way: the first
+  into the register, the second into the next, or into the instruction
+  itself where it is an integer of 0 to 65 535. A NULL in is a NULL
+  out. A shift by an integer that is not 0 to 63 fails the finish
+  (`IC_ERROR_BAD_PROGRAM`); by a value that is not, the operation
+  (891). The data node goes by a register's type: a shift right keeps
+  a signed value's sign and fills an unsigned column's value with
+  zeros, and a result with an unsigned value in it is unsigned
+  (chapter 05 §9.2). In C, `ic_program_bit_and` and the like, each
+  giving an `IC_PROGRAM_VALUE`.
+
 C follows the Rust API by the ABI's rules below, as the scans' did.
+
+### Instructions (phase 11.6, 2026-11-24)
+
+Asked for after the checks: loops, and more of the data node's
+instructions after them. A condition is a tree and a tree has no way
+back, so loops are not added to the `ProgramBuilder`; a second builder
+stands beside it, told the instructions in the order they run. Not yet
+seen by the author: its names and its shape are Q22.
+
+- **`InstructionBuilder::new(&table)`** (`ic_apid::instructions`). It
+  writes with the `ProgramWriter` the compiler writes with, which now
+  takes jumps backwards when told to (`allow_backward`), and gives a
+  `Program` like any other, so queries, scans, shapes, inputs and the
+  refusal's code by abort option are as they were.
+- **Registers** are named by number, 0 to 7 (`IC_PROGRAM_REGISTERS`);
+  the caller keeps track of them, where the compiler takes and gives
+  back its own.
+  - `read_column(reg, column)`, an integer column;
+  - `write_column(column, reg)`, of 32 or 64 bits, which makes the
+    program one that writes;
+  - `set_integer(reg, i64)`, in the fewest words, and `set_null(reg)`;
+  - `read_input(reg, n)`;
+  - `add`, `subtract` (`dest, a, b`), `add_integer`, `subtract_integer`
+    (`dest, src, u16`);
+  - since phase 11.7, `bit_and`, `bit_or`, `bit_xor` (`dest, a, b`)
+    and their `_integer` forms (`dest, src, u16`), `bit_not(dest,
+    src)`, `shift_left` and `shift_right` (`dest, a, count`, the count
+    a register) and `shift_left_integer` and `shift_right_integer`
+    (`dest, src, count`, 0 to 63, another failing the finish).
+- **Labels**: `label()` hands out a `Label`, `place(label)` puts it
+  before the next instruction, once. A jump may come before or after
+  its label is placed; one after goes backwards.
+- **Jumps**: `jump(to)`, `jump_if(cmp, a, b, to)` with the `Cmp` of
+  conditions, `jump_if_null(reg, to)`, `jump_if_value(reg, to)`.
+- **Endings**: `accept()`; `refuse()`, whose word is among those
+  rewritten as the program goes out, 626 or 6000; `refuse_with(code)`,
+  6001 to 6999, which makes the program one with codes of its own, so
+  a scan refuses it as it refuses one with checks.
+- **`finish()`** gives the builder's first error, else checks that
+  every label a jump goes to is placed, that the last instruction is an
+  ending or a `jump`, and the length, then resolves the jumps.
+  `IC_ERROR_BAD_PROGRAM` for a register, input, label or code that is
+  not one, a label placed twice or used and never placed, a jump to
+  itself, a program a row could run off the end of, or an empty one;
+  `IC_ERROR_NO_SUCH_FIELD`; `IC_ERROR_NOT_SUPPORTED` for a column that
+  is not an integer, or not wide enough to write;
+  `IC_ERROR_CONDITION_TOO_COMPLEX` for more than 32 000 words.
+- **Left to the program**: that a register read was written first,
+  that a register compared is not NULL (878), and that a loop ends
+  (886). No row runs off the end (872): every instruction but an
+  ending or a `jump` goes on to the next, and the last is one of
+  those.
+- **Not in it yet**: column tests against a constant or another column
+  (the `ProgramBuilder` has them), `ACCEPT_LAST`, constants from rows
+  written after the program, and the instructions the writer does not
+  write at all: multiply, divide and remainder, subroutines, the
+  memory area.
+
+In C: `ic_instructions_create(def, &b)`, `ic_instructions_free(b)`,
+`ic_instructions_label(b)` giving an `IC_PROGRAM_LABEL`
+(`IC_PROGRAM_NONE` for a null builder), and one function for each
+instruction, each returning 0 unless its builder is null:
+`ic_instructions_place`, `_read_column`, `_write_column`,
+`_set_integer`, `_set_null`, `_read_input`, `_add`, `_subtract`,
+`_add_integer`, `_subtract_integer`, `_bit_and`, `_bit_or`, `_bit_xor`
+and each with `_integer`, `_bit_not`, `_shift_left`, `_shift_right` and
+each with `_integer`, `_jump`, `_jump_if`,
+`_jump_if_null`, `_jump_if_value`, `_accept`, `_refuse`,
+`_refuse_with`; then `ic_instructions_finish(b, &program)`.
+`IC_NDB_ERROR_PROGRAM_NULL_REGISTER` (878),
+`IC_NDB_ERROR_PROGRAM_TOO_LONG` (886) and `IC_NDB_ERROR_PROGRAM_SHIFT`
+(891) name what the data node says of a program that goes wrong.
 
 ### AUTO_INCREMENT (phase 9.2; agreed with the author 2026-10-20)
 

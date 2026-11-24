@@ -2370,9 +2370,9 @@ for it (chapter 05 §9.4).
   for the condition, the update where both hold); a program too long is
   called too long (`IC_ERROR_CONDITION_TOO_COMPLEX`) also where one of
   its jumps is too far, which said `IC_ERROR_RECORD_SIZE_TOO_BIG`
-  before, with a unit test at the limit; 886, the data node's limit of
-  8000 instructions on a row, is in the error table and the user guide
-  (Q21).
+  before, with a unit test at the limit; 886, the data node's limit on
+  what a program runs on a row, is in the error table and the user
+  guide (Q21).
 - The `conditional_update` example, in Rust and in C, takes an amount
   from a row only if it is the caller's and holds enough, and is told
   6001 or 6002.
@@ -2383,6 +2383,72 @@ for it (chapter 05 §9.4).
   (chapter 10): whether 6000 is the application's too, checks on a
   scan, a `refuse_if`, and programs that run past the data node's
   limit.
+
+### 11.6 Programs written an instruction at a time, with loops (2026-11-24)
+
+Asked for after 11.5: the reference's programs loop, and use more of
+the data node's instructions than ours write; loops first, the
+instructions after. Not yet seen by the author (Q22).
+
+- `ProgramWriter` takes jumps backwards once told to
+  (`allow_backward`): bit 31 and the distance (chapter 05 §9.4). The
+  compiler of conditions does not tell it, and a jump backwards there
+  is still its own mistake. A jump to itself is refused for all.
+- `InstructionBuilder` (`ic_apid::instructions`; chapter 04,
+  "Instructions"): registers by number, labels, jumps either way on
+  registers, the columns read and written, the inputs, `accept`,
+  `refuse` and `refuse_with`. It gives a `Program`, so nothing changed
+  in queries, scans, shapes or the executor.
+- C: `IC_INSTRUCTION_BUILDER`, `IC_PROGRAM_LABEL`, the
+  `ic_instructions_` functions, `IC_PROGRAM_REGISTERS`,
+  `IC_NDB_ERROR_PROGRAM_NULL_REGISTER` and
+  `IC_NDB_ERROR_PROGRAM_TOO_LONG`.
+- What the data node runs on a row was measured, and the 8000 written
+  in 11.5 from the error's text put right: about 16 000, some
+  instructions for more than one (chapter 05 §9.4). 886's text of ours
+  no longer says a number.
+- Tests. Unit: a jump backwards' word, one too far back, one to
+  itself; a loop's words; the loop run on the model of the
+  interpreter, which now jumps backwards, says the code a program
+  refuses with and ends one that runs too long; what the finish
+  refuses; the length. Integration, the `loop_` group: an update that
+  multiplies by adding, with a NULL, a negative count and its code, a
+  loop that runs too long under each abort option, the count from an
+  input, 3000 turns and 5000; a scan filtered by the loop, and ended
+  by a row whose loop runs too long. The C API's program test writes a
+  loop through the header.
+- Not in it: an example, column tests in this builder, and the
+  instructions the writer does not write. The bitwise ones are next,
+  for both builders (11.7).
+
+### 11.7 Bitwise values and instructions (2026-11-24)
+
+The first of the instructions after the loops. Not yet seen by the
+author (Q22).
+
+- `ProgramWriter` writes `SHIFT_LEFT`, `SHIFT_RIGHT`, `BIT_AND`,
+  `BIT_OR`, `BIT_XOR` and `BIT_NOT`, and the five that take the field
+  for their second value (`BitOp`, `bits`, `bits_imm`, `bit_not`;
+  chapter 05 §9.2).
+- `ProgramBuilder`: the values `bit_and`, `bit_or`, `bit_xor`,
+  `bit_not`, `shift_left` and `shift_right`, compiled as sums are.
+- `InstructionBuilder`: the same on registers, each two-valued one
+  with an `_integer` form.
+- C: `ic_program_bit_and` and the like, `ic_instructions_bit_and` and
+  the like, `IC_NDB_ERROR_PROGRAM_SHIFT` (891), which is in the error
+  table.
+- Tests. Unit: the words of each; each value and each instruction on
+  the model of the interpreter, which runs them now; a loop that
+  counts the bits set; a count of bits that is none, at the finish and
+  as the model's 891. Integration, the `bits_` group: each value
+  assigned for a positive and a negative row and a NULL, with
+  integers in the instructions, an unsigned column shifted right, a
+  count of 64 from a row (891), a scan filtered by a mask from an
+  input; the loop that counts bits, and every instruction on
+  registers in one program. The C API's program test builds both kinds
+  through the header.
+- Not in it: multiply, divide and remainder, which are as near and
+  not asked for; an example.
 
 ## Phase 12 — BLOB, TEXT and JSON (about 7 weeks)
 
