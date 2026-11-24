@@ -2449,6 +2449,24 @@ author (Q22).
   through the header.
 - Not in it: multiply, divide and remainder, which are as near and
   not asked for; an example.
+- After a review the same day:
+  - a shift is worked out also where its answer is known without it
+    (`is_not_null` of a value never NULL, a comparison with a NULL
+    constant), so a count that is none fails the finish or the
+    operation there too; before, the shift and its input were left
+    out;
+  - a label carries its builder's mark, so another builder's label of
+    the same number is refused, where it was taken for ours;
+  - the user guide says that the count's sign decides a shift right
+    as the value's does, seen live;
+  - the test of 11.5 for a program too long with a jump too far did
+    not tell the two orders apart, since 11 000 checks are found too
+    long while they are compiled; it is now 8000 checks known to hold
+    and 8300 comparisons, which says `IC_ERROR_RECORD_SIZE_TOO_BIG`
+    with the old order;
+  - chapter 08's `cargo test` line for the integration tests has
+    `--test-threads=1`, as the xtask runs them: tests share their
+    tables.
 
 ## Phase 12 — BLOB, TEXT and JSON (about 7 weeks)
 

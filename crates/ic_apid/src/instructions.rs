@@ -26,11 +26,12 @@
 //!
 //! **Labels and jumps.** A label is made, used by any number of jumps,
 //! and placed once, before the instruction it names, before or after
-//! the jumps to it. A jump to a label placed before it goes backwards,
-//! which makes a loop. The data node ends a program that runs too long
-//! on a row (886): it counts about 16 000 instructions, some for more
-//! than one. So a loop that does not end fails its operation, or ends
-//! its scan, and nothing else.
+//! the jumps to it. It is good in the builder that made it, and
+//! another's is refused. A jump to a label placed before it goes
+//! backwards, which makes a loop. The data node ends a program that
+//! runs too long on a row (886): it counts about 16 000 instructions,
+//! some for more than one. So a loop that does not end fails its
+//! operation, or ends its scan, and nothing else.
 //!
 //! **Endings.** `accept` lets the row pass. `refuse` refuses it as a
 //! missed condition is refused: a scan skips the row, and a key
@@ -44,12 +45,15 @@
 //! What is wrong is kept as the builder's error until the finish, as
 //! the other builder keeps it.
 
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ic_port::err;
 use ic_port::IcError;
 use ic_signals::interp;
 use ic_signals::interp::BitOp;
+use ic_signals::interp::Label as Place;
 use ic_signals::interp::ProgramWriter;
 use ic_signals::table_props;
 
@@ -59,7 +63,36 @@ use crate::program::Cmp;
 use crate::program::Program;
 use crate::program::ProgramParts;
 
-pub use ic_signals::interp::Label;
+/// The builders made so far, for the next one's mark.
+static IC_BUILDERS_MADE: AtomicU32 = AtomicU32::new(0);
+
+/// The marks a builder may have: 16 bits, without 0, which no label
+/// has, and without the last, which with the last label would be the
+/// C API's `IC_PROGRAM_NONE`.
+const IC_BUILDER_MARKS: u32 = 0xFFFE;
+/// The labels a builder hands out at most; a program has fewer words
+/// than twice this.
+const IC_MAX_LABELS: usize = 0x1_0000;
+
+/// A place in a program that jumps go to, handed out by its builder
+/// before it is placed, and good in that builder only: its number
+/// carries its builder's mark, so that one from another builder is
+/// refused where it is used and not taken for a label of this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Label(u32);
+
+impl Label {
+  /// The label a number names, as the C API passes one.
+  pub fn from_u32(number: u32) -> Label {
+    Label(number)
+  }
+
+  /// The label's number: its builder's mark above its number in the
+  /// builder.
+  pub fn as_u32(self) -> u32 {
+    self.0
+  }
+}
 
 /// The registers a program has, numbered from 0.
 pub const IC_PROGRAM_REGISTERS: u32 = interp::IC_INTERP_REGISTERS;
@@ -71,6 +104,8 @@ pub struct InstructionBuilder {
   w: ProgramWriter,
   /// Where the `REFUSE` words of [`refuse`](Self::refuse) are.
   refusals: Vec<u32>,
+  /// The mark its labels carry, 1 to [`IC_BUILDER_MARKS`].
+  mark: u32,
   /// The labels a jump goes to, a flag each.
   used: Vec<bool>,
   inputs: u32,
@@ -91,6 +126,8 @@ impl InstructionBuilder {
       table: Arc::clone(table),
       w,
       refusals: Vec::new(),
+      mark: 1
+        + IC_BUILDERS_MADE.fetch_add(1, Ordering::Relaxed) % IC_BUILDER_MARKS,
       used: Vec::new(),
       inputs: 0,
       writes: false,
@@ -106,19 +143,30 @@ impl InstructionBuilder {
     &self.table
   }
 
-  /// A new label, to be placed once and jumped to from anywhere.
+  /// A new label, to be placed once and jumped to from anywhere in
+  /// this builder's program. One of another builder is refused where it
+  /// is used (`IC_ERROR_BAD_PROGRAM`).
   pub fn label(&mut self) -> Label {
+    let number = self.used.len();
+    if number >= IC_MAX_LABELS {
+      self.fail(err::IC_ERROR_CONDITION_TOO_COMPLEX);
+      return Label(0);
+    }
     self.used.push(false);
-    self.w.new_label()
+    self.w.new_label();
+    Label((self.mark << 16) | number as u32)
   }
 
   /// Place `label` before the next instruction.
   pub fn place(&mut self, label: Label) {
-    if !self.is_label(label) || self.w.place_of(label).is_some() {
-      self.fail(err::IC_ERROR_BAD_PROGRAM);
-      return;
-    }
-    self.w.place(label);
+    let place = match self.place_for(label) {
+      Some(place) if self.w.place_of(place).is_none() => place,
+      _ => {
+        self.fail(err::IC_ERROR_BAD_PROGRAM);
+        return;
+      }
+    };
+    self.w.place(place);
     // An instruction is to follow: a jump here must find one.
     self.ended = false;
   }
@@ -314,9 +362,10 @@ impl InstructionBuilder {
 
   /// Jump to `to`.
   pub fn jump(&mut self, to: Label) {
-    if !self.check_jump(to) {
-      return;
-    }
+    let to = match self.check_jump(to) {
+      Some(to) => to,
+      None => return,
+    };
     self.w.jump(to);
     self.ended = true;
   }
@@ -324,27 +373,39 @@ impl InstructionBuilder {
   /// Jump to `to` if R`a` compares with R`b` as `cmp` says, else go
   /// on. Both must hold values: a NULL fails the program (878).
   pub fn jump_if(&mut self, cmp: Cmp, a: u32, b: u32, to: Label) {
-    if !self.check_reg(a) || !self.check_reg(b) || !self.check_jump(to) {
+    if !self.check_reg(a) || !self.check_reg(b) {
       return;
     }
+    let to = match self.check_jump(to) {
+      Some(to) => to,
+      None => return,
+    };
     self.w.jump_if(cmp.reg_cmp(), a, b, to);
     self.ended = false;
   }
 
   /// Jump to `to` if R`reg` is NULL, else go on.
   pub fn jump_if_null(&mut self, reg: u32, to: Label) {
-    if !self.check_reg(reg) || !self.check_jump(to) {
+    if !self.check_reg(reg) {
       return;
     }
+    let to = match self.check_jump(to) {
+      Some(to) => to,
+      None => return,
+    };
     self.w.jump_if_null(reg, to);
     self.ended = false;
   }
 
   /// Jump to `to` if R`reg` holds a value, else go on.
   pub fn jump_if_value(&mut self, reg: u32, to: Label) {
-    if !self.check_reg(reg) || !self.check_jump(to) {
+    if !self.check_reg(reg) {
       return;
     }
+    let to = match self.check_jump(to) {
+      Some(to) => to,
+      None => return,
+    };
     self.w.jump_if_value(reg, to);
     self.ended = false;
   }
@@ -391,7 +452,7 @@ impl InstructionBuilder {
     }
     let mut label: u32 = 0;
     while (label as usize) < self.used.len() {
-      let placed = self.w.place_of(Label::from_u32(label)).is_some();
+      let placed = self.w.place_of(Place::from_u32(label)).is_some();
       if self.used[label as usize] && !placed {
         return Err(IcError::new(err::IC_ERROR_BAD_PROGRAM));
       }
@@ -414,8 +475,14 @@ impl InstructionBuilder {
     })))
   }
 
-  fn is_label(&self, label: Label) -> bool {
-    (label.as_u32() as usize) < self.used.len()
+  /// The writer's label behind `label`, if it is this builder's: its
+  /// mark is ours and its number one handed out.
+  fn place_for(&self, label: Label) -> Option<Place> {
+    let number = label.0 & 0xFFFF;
+    if label.0 >> 16 != self.mark || number as usize >= self.used.len() {
+      return None;
+    }
+    Some(Place::from_u32(number))
   }
 
   /// A register there is.
@@ -452,14 +519,20 @@ impl InstructionBuilder {
     true
   }
 
-  /// A label of this builder, and not one placed at the jump itself.
-  fn check_jump(&mut self, to: Label) -> bool {
-    if !self.is_label(to) || self.w.place_of(to) == Some(self.w.len() as u32) {
-      self.fail(err::IC_ERROR_BAD_PROGRAM);
-      return false;
-    }
-    self.used[to.as_u32() as usize] = true;
-    true
+  /// The writer's label for a jump to `to`: a label of this builder,
+  /// and not one placed at the jump itself.
+  fn check_jump(&mut self, to: Label) -> Option<Place> {
+    let place = match self.place_for(to) {
+      Some(place) if self.w.place_of(place) != Some(self.w.len() as u32) => {
+        place
+      }
+      _ => {
+        self.fail(err::IC_ERROR_BAD_PROGRAM);
+        return None;
+      }
+    };
+    self.used[(to.0 & 0xFFFF) as usize] = true;
+    Some(place)
   }
 
   /// Keep the first error.
@@ -816,6 +889,24 @@ mod tests {
       }),
       bad
     );
+    // Another builder's label, of the same number as one of ours, is
+    // not taken for ours.
+    let mut other = InstructionBuilder::new(&test_table());
+    let theirs = other.label();
+    let mut b = InstructionBuilder::new(&test_table());
+    let ours = b.label();
+    assert_eq!(theirs.as_u32() & 0xFFFF, ours.as_u32() & 0xFFFF);
+    assert_ne!(theirs, ours);
+    b.jump_if_null(0, theirs);
+    b.accept();
+    b.place(ours);
+    b.refuse_with(6002);
+    assert_eq!(b.finish().expect_err("another's label").code, bad);
+    let mut b = InstructionBuilder::new(&test_table());
+    let _ours = b.label();
+    b.place(theirs);
+    b.accept();
+    assert_eq!(b.finish().expect_err("another's label placed").code, bad);
     assert_eq!(
       refused(|b| {
         let here = b.label();

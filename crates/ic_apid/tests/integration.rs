@@ -13103,6 +13103,48 @@ fn bits_values_of_a_program_are_what_the_data_node_makes_of_them() {
   assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
   assert_eq!(bits_w(1), Some(15));
 
+  // The count's sign counts too: row 2's val is -12 and its big 1, an
+  // unsigned count, which makes the shift one of an unsigned value,
+  // filled with zeros.
+  let mut b = ProgramBuilder::new(&t.def);
+  let x = b.column(val);
+  let count = b.column(big);
+  let top = b.shift_right(x, count);
+  b.assign(w, top);
+  let program = b.finish(None).expect("the program");
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&program)).expect("the program");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 2, AbortOption::Default);
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  assert_eq!(bits_w(2), Some(((-12i64 as u64) >> 1) as i64));
+
+  // A shift whose answer is known without it is made all the same:
+  // 1 shifted by input 0 is never NULL, and a count of 64 still fails
+  // the operation, where 3 lets the update through.
+  let mut b = ProgramBuilder::new(&t.def);
+  let one = b.integer(1);
+  let by = b.input(0);
+  let shifted = b.shift_left(one, by);
+  let top = b.is_not_null(shifted);
+  let seven = b.integer(7);
+  b.assign(w, seven);
+  let program = b.finish(Some(top)).expect("the program");
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_program(Some(&program)).expect("the program");
+  query.set_input(0, 64).expect("the count");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::RolledBack, "{:?} {:?}", qe, te);
+  assert!(loop_said(IC_IT_BITS_SHIFT, qe, te), "{:?} {:?}", qe, te);
+  assert_eq!(bits_w(1), Some(15));
+  let query = conn.query_mut(guarded).expect("the query");
+  query.set_input(0, 3).expect("the count");
+  let (state, qe, te) =
+    loop_update(&mut conn, &t, &key_rec, guarded, 1, AbortOption::Default);
+  assert_eq!(state, CommitState::Committed, "{:?} {:?}", qe, te);
+  assert_eq!(bits_w(1), Some(7));
+
   // Row 4's n is 64, which is no count of bits: the operation fails.
   let mut b = ProgramBuilder::new(&t.def);
   let x = b.column(val);

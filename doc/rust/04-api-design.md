@@ -1239,8 +1239,12 @@ between them, without subroutine ids for the caller to keep:
   (891). The data node goes by a register's type: a shift right keeps
   a signed value's sign and fills an unsigned column's value with
   zeros, and a result with an unsigned value in it is unsigned
-  (chapter 05 §9.2). In C, `ic_program_bit_and` and the like, each
-  giving an `IC_PROGRAM_VALUE`.
+  (chapter 05 §9.2). A value that can fail, a shift, is worked out
+  also where its answer is known without it, in `is_null` and
+  `is_not_null` of a value that is never NULL and in a comparison with
+  a NULL constant, so that a count that is none fails there as
+  elsewhere; a sum cannot fail and is left out as before. In C,
+  `ic_program_bit_and` and the like, each giving an `IC_PROGRAM_VALUE`.
 
 C follows the Rust API by the ABI's rules below, as the scans' did.
 
@@ -1274,7 +1278,12 @@ seen by the author: its names and its shape are Q22.
     (`dest, src, count`, 0 to 63, another failing the finish).
 - **Labels**: `label()` hands out a `Label`, `place(label)` puts it
   before the next instruction, once. A jump may come before or after
-  its label is placed; one after goes backwards.
+  its label is placed; one after goes backwards. A label's number has
+  its builder's mark in its upper 16 bits and its number in the
+  builder below, so one of another builder is refused
+  (`IC_ERROR_BAD_PROGRAM`) and not taken for a label of the same
+  number here; the marks go round after 65 534 builders. A builder
+  hands out 65 536 labels at most.
 - **Jumps**: `jump(to)`, `jump_if(cmp, a, b, to)` with the `Cmp` of
   conditions, `jump_if_null(reg, to)`, `jump_if_value(reg, to)`.
 - **Endings**: `accept()`; `refuse()`, whose word is among those

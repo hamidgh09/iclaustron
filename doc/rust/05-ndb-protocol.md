@@ -2535,9 +2535,10 @@ in R1 or R2 gives NULL. A shift's count is 0 to 63, and another, from
 a register or the field, is error 891. They go by the registers'
 types: `SHIFT_RIGHT` of a signed value keeps its sign (−12 by 2 is −3)
 and of an unsigned one fills with zeros (a BIGINT UNSIGNED column of
-0xF000000000000000 by 60 is 15). Read in the code and not tried: a
-result is unsigned where either value is, and a double in a register
-is refused (878).
+0xF000000000000000 by 60 is 15). A result is unsigned where either
+value is, the count included: −12 shifted right by an unsigned
+column's 1 is 0x7FFFFFFFFFFFFFFA. Read in the code and not tried: a
+double in a register is refused (878).
 
 ### 9.3 Column tests (23, 26, 27)
 

@@ -1004,7 +1004,13 @@ impl<'a> Compiler<'a> {
   ) -> Result<(), IcError> {
     let builder = self.b;
     if self.is_null_constant(a) || self.is_null_constant(b) {
-      // Unknown, as SQL has a comparison with NULL, either way round.
+      // Unknown, as SQL has a comparison with NULL, either way round;
+      // a side that can fail is still worked out.
+      for side in [a, b] {
+        if self.may_fail(side, 0)? {
+          self.eval(side, 0, 0)?;
+        }
+      }
       self.fixed(false, to, when);
       return Ok(());
     }
@@ -1148,6 +1154,11 @@ impl<'a> Compiler<'a> {
       return Ok(());
     }
     if !self.may_be_null(v, 0)? {
+      // Never NULL, so the answer is known; but a value that can fail
+      // is still worked out, so that it fails as it would anywhere.
+      if self.may_fail(v, 0)? {
+        self.eval(v, 0, 0)?;
+      }
       self.fixed(!is_null, to, when);
       return Ok(());
     }
@@ -1158,6 +1169,29 @@ impl<'a> Compiler<'a> {
       self.w.jump_if_value(0, to);
     }
     Ok(())
+  }
+
+  /// True if working `v` out can fail the program, or the finish: a
+  /// shift, whose count may be no count of bits.
+  fn may_fail(&self, v: Value, depth: u32) -> Result<bool, IcError> {
+    if depth > IC_MAX_DEPTH {
+      return Err(IcError::new(err::IC_ERROR_CONDITION_TOO_COMPLEX));
+    }
+    match &self.b.values[v.0 as usize] {
+      ValueNode::Column(_)
+      | ValueNode::Constant { .. }
+      | ValueNode::Integer(_)
+      | ValueNode::Input(_) => Ok(false),
+      ValueNode::Add(x, y) | ValueNode::Subtract(x, y) => {
+        Ok(self.may_fail(*x, depth + 1)? || self.may_fail(*y, depth + 1)?)
+      }
+      ValueNode::Bits(op, x, y) => Ok(
+        op.is_shift()
+          || self.may_fail(*x, depth + 1)?
+          || self.may_fail(*y, depth + 1)?,
+      ),
+      ValueNode::BitNot(x) => self.may_fail(*x, depth + 1),
+    }
   }
 
   fn is_null_constant(&self, v: Value) -> bool {
@@ -2123,6 +2157,51 @@ mod tests {
   }
 
   #[test]
+  fn a_shift_whose_answer_is_not_needed_is_still_worked_out() {
+    // 1 shifted is never NULL, so IS NOT NULL is known to hold; the
+    // shift is made all the same, and a count that is none fails as it
+    // would in any other place.
+    let build = |count: fn(&mut ProgramBuilder) -> Value, compared: bool| {
+      let mut f = Fixture::new();
+      let one = f.b.integer(1);
+      let by = count(&mut f.b);
+      let shifted = f.b.shift_left(one, by);
+      let top = if compared {
+        let null = f.null(VAL);
+        f.b.compare(Cmp::Eq, shifted, null)
+      } else {
+        f.b.is_not_null(shifted)
+      };
+      f.b.finish(Some(top))
+    };
+    let row = [Some(1), Some(1), None, None, None, Some(0), None];
+    let mut inputs = [0i64; 16];
+    for compared in [false, true] {
+      // An integer that is no count fails the finish.
+      let e = build(|b| b.integer(64), compared).expect_err("the count");
+      assert_eq!(e.code, err::IC_ERROR_BAD_PROGRAM);
+      // A count from an input is sent, and decides at the row.
+      let p = build(|b| b.input(2), compared).expect("finish");
+      assert_eq!(p.inputs(), 0b100);
+      inputs[2] = 3;
+      let ran = run(p.words(), &row, &inputs).map(|r| r.0);
+      assert_eq!(ran, Ok(!compared), "compared {}", compared);
+      inputs[2] = 64;
+      let ran = run(p.words(), &row, &inputs).map(|r| r.0);
+      assert_eq!(ran, Err("891".to_string()), "compared {}", compared);
+    }
+    // A sum cannot fail, and is left out as before.
+    let mut f = Fixture::new();
+    let one = f.b.integer(1);
+    let n = f.b.input(2);
+    let sum = f.b.add(one, n);
+    let top = f.b.is_not_null(sum);
+    let p = f.b.finish(Some(top)).expect("finish");
+    assert_eq!(p.words(), [0x12, 0x0272_0013]);
+    assert_eq!(p.inputs(), 0);
+  }
+
+  #[test]
   fn a_program_too_long_for_its_checks_is_called_too_long() {
     // A check is three words and its refusal one; with the acceptance
     // 7 999 checks are 31 997 words, 8 000 are 32 001.
@@ -2141,9 +2220,24 @@ mod tests {
     assert_eq!(p.words()[31_996], (6001 + 7_998 % 999) << 16 | 0x13);
     let e = build(8_000).expect_err("one more");
     assert_eq!(e.code, err::IC_ERROR_CONDITION_TOO_COMPLEX);
-    // The first of 11 000 checks jumps further than a jump reaches:
-    // the program is still called too long.
-    let e = build(11_000).expect_err("a jump too far");
+    // A program whose length is found only at the end, and which has
+    // a jump too far besides: 8000 checks known to hold are a refusal
+    // each and nothing before it, and 8300 comparisons after them are
+    // 24 900 words, so no comparison sees more than 32 000 while it is
+    // compiled. The 16 300 refusals make 41 201, and the first
+    // comparison's is 32 901 words on. It is called too long, not for
+    // its jump.
+    let mut f = Fixture::new();
+    let one = f.b.integer(1);
+    let holds = f.b.is_not_null(one);
+    let above = f.compare_int(Cmp::Gt, VAL, 100);
+    for _ in 0..8_000 {
+      f.b.refuse_unless(holds, 6001);
+    }
+    for _ in 0..8_300 {
+      f.b.refuse_unless(above, 6002);
+    }
+    let e = f.b.finish(None).expect_err("a jump too far");
     assert_eq!(e.code, err::IC_ERROR_CONDITION_TOO_COMPLEX);
   }
 

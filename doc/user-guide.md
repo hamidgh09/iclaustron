@@ -775,7 +775,12 @@ ret = ic_program_builder_finish(
   fails the operation with 891.
 - A shift right keeps the sign of a signed value, so -12 shifted by 2
   is -3. A value of an unsigned column is unsigned, and is filled with
-  zeros.
+  zeros. The count's sign counts as the value's does: a signed value
+  shifted by a count from an unsigned column is taken as unsigned and
+  filled with zeros too, so -12 shifted by such a 2 is
+  0x3FFFFFFFFFFFFFFD. Integers and inputs are signed.
+- A shift is made even where its answer is not needed: `is_not_null` of
+  a shift by a count that is none fails as any other use of it does.
 - `bit_not` inverts all 64 bits: of 12 it gives -13.
 
 **Instructions: programs with loops.** What a condition and its
@@ -799,7 +804,8 @@ same way, with the same inputs.
 - `write_column(column, reg)` into an integer column of 32 or 64 bits,
   on an update only;
 - labels: `label()` makes one, `place(label)` puts it before the next
-  instruction, once;
+  instruction, once. A label is good in the builder that made it and
+  refused in another;
 - jumps: `jump(label)`, `jump_if(cmp, a, b, label)` on two registers,
   `jump_if_null(reg, label)` and `jump_if_value(reg, label)`. A jump to
   a label placed before it goes backwards, which is a loop;
